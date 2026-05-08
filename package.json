@@ -1,0 +1,26 @@
+{
+  "name": "claude-code-shelving",
+  "version": "0.1.0",
+  "description": "Deliberate context-shelving for Claude Code: model-driven compress/decompress with cache-stable proxy substitution. Manual mode by default.",
+  "type": "module",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "tsc",
+    "test": "node --test --import tsx tests/*.test.ts",
+    "test:registry": "node --test --import tsx tests/registry.test.ts",
+    "mcp": "tsx src/mcp/server.ts",
+    "proxy": "tsx src/proxy/server.ts"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "tsx": "^4.0.0",
+    "typescript": "^5.0.0"
+  },
+  "license": "MIT",
+  "private": true
+}

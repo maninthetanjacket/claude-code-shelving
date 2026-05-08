@@ -1,0 +1,205 @@
+import type { Block } from "../shared/types.js";
+
+/**
+ * Pure transformation logic for the proxy.
+ *
+ * Input: an Anthropic Messages API request body (parsed JSON), a UUID→content
+ * map derived from the session JSONL, and the list of active blocks for the
+ * session.
+ *
+ * Output: a modified request body where each compressed range has been
+ * collapsed to its summary at the anchor position.
+ *
+ * Matching strategy: content-based. We can't rely on positional alignment
+ * between the JSONL and the API request (CC may strip or transform some
+ * entries), so we content-match each request message against the
+ * UUID→content map to recover its UUID, then check membership in active
+ * blocks.
+ *
+ * Cache stability: this function is deterministic given the same inputs.
+ * Same registry + same JSONL state = same output bytes.
+ */
+
+/**
+ * A single message in the Anthropic Messages API request.
+ * `content` may be a plain string or an array of content blocks
+ * (text, tool_use, tool_result, image, etc).
+ */
+export interface ApiMessage {
+  role: "user" | "assistant";
+  content: string | unknown[];
+}
+
+export interface ApiRequest {
+  messages: ApiMessage[];
+  // Other fields (model, system, tools, etc.) pass through unchanged.
+  [key: string]: unknown;
+}
+
+/** A message from the session JSONL, simplified to what we need. */
+export interface JsonlMessage {
+  uuid: string;
+  role: "user" | "assistant";
+  content: string | unknown[];
+}
+
+export interface TransformResult {
+  request: ApiRequest;
+  /** Number of API messages substituted with a summary (anchor positions). */
+  anchors_substituted: number;
+  /** Number of API messages dropped entirely (non-anchor compressed messages). */
+  messages_dropped: number;
+  /** Active blocks that had any matched message in this request. */
+  blocks_applied: number[];
+  /** Active blocks that had no matched messages (likely older than current request scope). */
+  blocks_inactive_in_request: number[];
+}
+
+/**
+ * Apply registered substitutions to an API request.
+ *
+ * Algorithm:
+ *  1. Build a content-key index over the JSONL: `key(content) → uuid`
+ *  2. For each active block, look up the content of every UUID in
+ *     `block.compressed_uuids` to build the set of content-keys to match.
+ *  3. Walk the request's messages array. For each message:
+ *     - Compute its content-key.
+ *     - If the key matches a UUID in some active block:
+ *       - If that UUID is the block's anchor: replace content with the
+ *         block's summary.
+ *       - Else: mark the message for drop.
+ *     - Else: pass through.
+ *  4. Return the messages array with drops removed and anchors substituted.
+ *
+ * Failure modes (all fail-safe to no-op for affected messages, leaving the
+ * passthrough version reaching the API):
+ *  - JSONL doesn't contain a UUID listed in a block: that UUID's
+ *    content-key is unknown, so its message in the request won't match;
+ *    the request message passes through. The block is still considered
+ *    "applied" if any of its UUIDs did match.
+ *  - Two different UUIDs have identical content (e.g., a repeated empty
+ *    string): the second one would match the first one's block. Practically
+ *    rare in real conversations; we accept the risk for v1.
+ */
+export function applySubstitutions(
+  request: ApiRequest,
+  jsonlMessages: JsonlMessage[],
+  activeBlocks: Block[],
+): TransformResult {
+  if (activeBlocks.length === 0) {
+    return {
+      request,
+      anchors_substituted: 0,
+      messages_dropped: 0,
+      blocks_applied: [],
+      blocks_inactive_in_request: [],
+    };
+  }
+
+  // Build content-key → uuid map from the JSONL.
+  // If two UUIDs share a content-key, last one wins (rare; documented).
+  const keyToUuid = new Map<string, string>();
+  for (const m of jsonlMessages) {
+    keyToUuid.set(contentKey(m.role, m.content), m.uuid);
+  }
+
+  // Build uuid → block lookup for each active block, plus uuid → role-in-block.
+  // role_in_block: "anchor" or "drop".
+  type Role = "anchor" | "drop";
+  const uuidToBlock = new Map<string, { block: Block; role: Role }>();
+  for (const block of activeBlocks) {
+    for (let i = 0; i < block.compressed_uuids.length; i++) {
+      const uuid = block.compressed_uuids[i];
+      if (uuid === undefined) continue;
+      const role: Role = uuid === block.anchor_uuid ? "anchor" : "drop";
+      uuidToBlock.set(uuid, { block, role });
+    }
+  }
+
+  const newMessages: ApiMessage[] = [];
+  const blocksApplied = new Set<number>();
+  let anchorsSubstituted = 0;
+  let messagesDropped = 0;
+
+  for (const apiMsg of request.messages) {
+    const key = contentKey(apiMsg.role, apiMsg.content);
+    const uuid = keyToUuid.get(key);
+    if (uuid === undefined) {
+      // Not found in JSONL (could be a system-injected message or content
+      // that CC transformed before sending). Pass through.
+      newMessages.push(apiMsg);
+      continue;
+    }
+    const hit = uuidToBlock.get(uuid);
+    if (hit === undefined) {
+      // UUID exists in JSONL but not in any active block. Pass through.
+      newMessages.push(apiMsg);
+      continue;
+    }
+    blocksApplied.add(hit.block.block_id);
+    if (hit.role === "anchor") {
+      // Substitute content with the block's summary.
+      // Use a single user-role text message containing the summary, prefixed
+      // with a marker so the model can recognize the substitution.
+      newMessages.push({
+        role: apiMsg.role,
+        content: formatSummaryContent(hit.block, apiMsg.content),
+      });
+      anchorsSubstituted++;
+    } else {
+      // Drop this message entirely.
+      messagesDropped++;
+    }
+  }
+
+  const blocksAppliedList = Array.from(blocksApplied).sort((a, b) => a - b);
+  const blocksInactive = activeBlocks
+    .map((b) => b.block_id)
+    .filter((id) => !blocksApplied.has(id))
+    .sort((a, b) => a - b);
+
+  return {
+    request: { ...request, messages: newMessages },
+    anchors_substituted: anchorsSubstituted,
+    messages_dropped: messagesDropped,
+    blocks_applied: blocksAppliedList,
+    blocks_inactive_in_request: blocksInactive,
+  };
+}
+
+/**
+ * Produce a content-key for a (role, content) pair.
+ *
+ * Stringifies content deterministically. For string content, the key is just
+ * `<role>:<content>`. For array content, JSON-serialize with a stable key
+ * order (which `JSON.stringify` provides for object keys in insertion order;
+ * we don't depend on key reordering here).
+ */
+function contentKey(role: string, content: string | unknown[]): string {
+  if (typeof content === "string") {
+    return `${role}:s:${content}`;
+  }
+  return `${role}:a:${JSON.stringify(content)}`;
+}
+
+/**
+ * Format the content that will replace an anchor message.
+ *
+ * For Stage 1, we replace with a simple text block prefixed with a marker
+ * indicating the substitution. The marker is informational; it tells the
+ * model "this is a summary of N original messages, block_id X" without
+ * commanding any action.
+ *
+ * `originalContent` is unused in Stage 1; reserved for future variants
+ * that might preserve some structure (e.g., keep original tool_use blocks).
+ */
+function formatSummaryContent(
+  block: Block,
+  _originalContent: string | unknown[],
+): string {
+  const focus = block.focus !== null ? ` — ${block.focus}` : "";
+  return (
+    `[shelved: block ${block.block_id}, ${block.compressed_uuids.length} messages${focus}]\n\n` +
+    block.summary
+  );
+}
