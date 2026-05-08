@@ -134,7 +134,17 @@ function buildResponseHeaders(
 ): Record<string, string | string[]> {
   const out: Record<string, string | string[]> = {};
   upstream.headers.forEach((value, key) => {
-    if (key === "transfer-encoding") return;
+    const lower = key.toLowerCase();
+    // fetch() transparently decodes compressed upstream responses, so forwarding
+    // the original encoding/length headers would make downstream clients try to
+    // decode an already-decoded body.
+    if (
+      lower === "transfer-encoding" ||
+      lower === "content-encoding" ||
+      lower === "content-length"
+    ) {
+      return;
+    }
     const existing = out[key];
     if (existing === undefined) {
       out[key] = value;
@@ -215,7 +225,7 @@ async function handleMessages(
   const upstreamRes = await fetch(upstreamUrl, {
     method: "POST",
     headers: upstreamHeaders,
-    body: modifiedBuf.toString("utf-8"),
+    body: new Uint8Array(modifiedBuf),
   });
 
   const respHeaders = buildResponseHeaders(upstreamRes);
@@ -252,7 +262,7 @@ async function handlePassthrough(
   const upstreamRes = await fetch(upstreamUrl, {
     method: req.method ?? "GET",
     headers: upstreamHeaders,
-    body: bodyBuf === undefined ? undefined : bodyBuf.toString("utf-8"),
+    body: bodyBuf === undefined ? undefined : new Uint8Array(bodyBuf),
   });
   const respHeaders = buildResponseHeaders(upstreamRes);
   res.writeHead(upstreamRes.status, respHeaders);

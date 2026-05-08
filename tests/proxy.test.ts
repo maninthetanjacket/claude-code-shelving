@@ -10,6 +10,7 @@ import {
   type ServerResponse,
 } from "node:http";
 import { AddressInfo } from "node:net";
+import { gzipSync } from "node:zlib";
 
 import {
   createProxyServer,
@@ -61,9 +62,10 @@ interface FakeUpstream {
   url: URL;
   captured: CapturedRequest[];
   /** Fixed response body to return for all requests. */
-  responseBody: string;
+  responseBody: string | Buffer;
   responseStatus: number;
   responseContentType: string;
+  responseHeaders: Record<string, string>;
   close: () => Promise<void>;
 }
 
@@ -75,6 +77,7 @@ async function startFakeUpstream(): Promise<FakeUpstream> {
     responseBody: '{"id":"msg_test","content":[{"type":"text","text":"ok"}]}',
     responseStatus: 200,
     responseContentType: "application/json",
+    responseHeaders: {},
     close: async () => {},
   };
 
@@ -97,6 +100,7 @@ async function startFakeUpstream(): Promise<FakeUpstream> {
         });
         res.writeHead(upstream.responseStatus, {
           "content-type": upstream.responseContentType,
+          ...upstream.responseHeaders,
         });
         res.end(upstream.responseBody);
       });
@@ -237,6 +241,36 @@ test("E2E: passthrough when no active blocks for session", async () => {
     });
     assert.equal(res.status, 200);
     assert.equal(upstream.captured[0]?.body, reqBody);
+  } finally {
+    await proxy.close();
+    await upstream.close();
+  }
+});
+
+test("E2E: gzipped upstream responses are decoded once for downstream clients", async () => {
+  const upstream = await startFakeUpstream();
+  const proxy = await startProxy(upstream.url);
+  try {
+    const plainBody = '{"id":"msg_test","content":[{"type":"text","text":"ok"}]}';
+    const compressedBody = gzipSync(Buffer.from(plainBody, "utf-8"));
+    upstream.responseBody = compressedBody;
+    upstream.responseHeaders = {
+      "content-encoding": "gzip",
+      "content-length": String(compressedBody.length),
+    };
+
+    const res = await fetch(new URL("/v1/messages?beta=true", proxy.url), {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "claude-opus-4.7",
+        messages: [{ role: "user", content: "hello" }],
+      }),
+    });
+
+    assert.equal(res.status, 200);
+    assert.equal(res.headers.get("content-encoding"), null);
+    assert.equal(await res.text(), plainBody);
   } finally {
     await proxy.close();
     await upstream.close();
