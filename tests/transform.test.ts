@@ -198,6 +198,116 @@ test("array-form content is matched by JSON serialization", () => {
   assert.equal(typeof result.request.messages[0]?.content, "string");
 });
 
+test("attachment-derived Read reminder and result can be substituted by shared uuid", () => {
+  const reminder =
+    '<system-reminder>\nCalled the Read tool with the following input: {"file_path":"/tmp/example.md"}\n</system-reminder>';
+  const resultBlock = [
+    {
+      type: "text",
+      text:
+        "<system-reminder>\n" +
+        "Result of calling the Read tool:\n" +
+        "1\t# Title\n" +
+        "2\tBody\n" +
+        "</system-reminder>",
+    },
+  ];
+
+  const request = makeRequest([
+    { role: "user", content: "Prompt with @reference" },
+    { role: "user", content: reminder },
+    { role: "user", content: resultBlock },
+    { role: "assistant", content: "Response after reading file" },
+  ]);
+  const jsonl = makeJsonl([
+    ["u1", "user", "Prompt with @reference"],
+    ["att1", "user", reminder],
+    ["att1", "user", resultBlock],
+    ["u2", "assistant", "Response after reading file"],
+  ]);
+  const block = makeBlock({
+    anchor_uuid: "u1",
+    compressed_uuids: ["u1", "att1", "u2"],
+    summary: "Collapsed @reference exchange.",
+  });
+
+  const result = applySubstitutions(request, jsonl, [block]);
+  assert.equal(result.request.messages.length, 1);
+  assert.match(
+    result.request.messages[0]?.content as string,
+    /Collapsed @reference exchange\./,
+  );
+  assert.equal(result.anchors_substituted, 1);
+  assert.equal(result.messages_dropped, 3);
+  assert.deepEqual(result.blocks_applied, [1]);
+});
+
+test("combined attachment result plus prompt and assistant thinking still match the compressed block", () => {
+  const readResult =
+    "<system-reminder>\n" +
+    "Result of calling the Read tool:\n" +
+    "1\t# Title\n" +
+    "2\tBody\n" +
+    "</system-reminder>";
+
+  const request = makeRequest([
+    {
+      role: "user",
+      content:
+        '<system-reminder>\nCalled the Read tool with the following input: {"file_path":"/tmp/example.md"}\n</system-reminder>',
+    },
+    {
+      role: "user",
+      content: [
+        { type: "text", text: readResult + "\n" },
+        { type: "text", text: "Prompt with @reference" },
+      ],
+    },
+    {
+      role: "assistant",
+      content: [
+        { type: "thinking", thinking: "private reasoning", signature: "sig" },
+        { type: "text", text: "Response after reading file" },
+      ],
+    },
+  ]);
+
+  const jsonl: JsonlMessage[] = [
+    { uuid: "u1", role: "user", content: "Prompt with @reference" },
+    {
+      uuid: "att1",
+      role: "user",
+      content:
+        '<system-reminder>\nCalled the Read tool with the following input: {"file_path":"/tmp/example.md"}\n</system-reminder>',
+    },
+    {
+      uuid: "att1",
+      role: "user",
+      content: [{ type: "text", text: readResult }],
+    },
+    {
+      uuid: "u2",
+      role: "assistant",
+      content: [{ type: "text", text: "Response after reading file" }],
+    },
+  ];
+  const block = makeBlock({
+    anchor_uuid: "u1",
+    compressed_uuids: ["u1", "att1", "u2"],
+    summary: "Collapsed @reference exchange.",
+  });
+
+  const result = applySubstitutions(request, jsonl, [block]);
+  assert.equal(result.request.messages.length, 1);
+  assert.match(
+    result.request.messages[0]?.content as string,
+    /Collapsed @reference exchange\./,
+  );
+  assert.equal(result.anchors_substituted, 1);
+  assert.equal(result.messages_dropped, 2);
+  assert.deepEqual(result.blocks_applied, [1]);
+});
+
 test("multiple non-overlapping blocks: each applied independently", () => {
   const request = makeRequest([
     { role: "user", content: "a1" },

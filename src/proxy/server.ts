@@ -35,6 +35,8 @@ import {
 } from "node:http";
 import { request as httpsRequest } from "node:https";
 import { once } from "node:events";
+import { mkdir, writeFile } from "node:fs/promises";
+import { join } from "node:path";
 import { applySubstitutions } from "./transform.js";
 import { getActiveBlocksCached, getJsonlMessagesCached } from "./cache.js";
 
@@ -47,6 +49,13 @@ export interface ProxyConfig {
   bind: string;
   upstream: URL;
   logLevel: "silent" | "info" | "debug";
+  /**
+   * If set, every /v1/messages request is dumped to this directory as a JSON
+   * file containing the original body, transformed body (if changed), and
+   * substitution metadata. Useful for debugging why substitutions aren't
+   * applying as expected. Disabled when undefined.
+   */
+  dumpDir?: string;
 }
 
 export function loadConfigFromEnv(): ProxyConfig {
@@ -58,7 +67,12 @@ export function loadConfigFromEnv(): ProxyConfig {
   const rawLevel = process.env["SHELVING_PROXY_LOG_LEVEL"] ?? "info";
   const logLevel: ProxyConfig["logLevel"] =
     rawLevel === "silent" || rawLevel === "debug" ? rawLevel : "info";
-  return { port, bind, upstream, logLevel };
+  const dumpDirRaw = process.env["SHELVING_PROXY_DUMP_DIR"];
+  const dumpDir =
+    dumpDirRaw !== undefined && dumpDirRaw.length > 0 ? dumpDirRaw : undefined;
+  const config: ProxyConfig = { port, bind, upstream, logLevel };
+  if (dumpDir !== undefined) config.dumpDir = dumpDir;
+  return config;
 }
 
 function makeLogger(level: ProxyConfig["logLevel"]) {
@@ -232,6 +246,53 @@ async function pipeUpstreamResponse(
 }
 
 // ---------------------------------------------------------------------------
+// Debug dump
+// ---------------------------------------------------------------------------
+
+let dumpSeq = 0;
+
+async function writeDump(
+  dumpDir: string,
+  meta: Record<string, unknown>,
+  originalBody: Buffer,
+  modifiedBody: Buffer,
+  log: ReturnType<typeof makeLogger>,
+): Promise<void> {
+  try {
+    await mkdir(dumpDir, { recursive: true });
+    dumpSeq += 1;
+    const seq = String(dumpSeq).padStart(5, "0");
+    const stem = `${(meta["timestamp"] as string).replace(/[:.]/g, "-")}-${seq}`;
+
+    // Always write metadata
+    await writeFile(
+      join(dumpDir, `${stem}.meta.json`),
+      JSON.stringify(meta, null, 2) + "\n",
+      "utf-8",
+    );
+
+    // Always write the original body (what CC sent)
+    await writeFile(join(dumpDir, `${stem}.original.json`), originalBody, {
+      encoding: "utf-8",
+    });
+
+    // Write the transformed body only if it differs from the original
+    if (modifiedBody !== originalBody) {
+      await writeFile(join(dumpDir, `${stem}.transformed.json`), modifiedBody, {
+        encoding: "utf-8",
+      });
+    }
+
+    log("debug", `dumped request artifacts to ${dumpDir}/${stem}.*`);
+  } catch (err) {
+    log(
+      "info",
+      `dump write failed: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
 // /v1/messages handler
 // ---------------------------------------------------------------------------
 
@@ -253,6 +314,13 @@ async function handleMessages(
   let modifiedBuf = bodyBuf;
   let transformInfo = "passthrough";
 
+  // Captured for the dump file when SHELVING_PROXY_DUMP_DIR is set.
+  let dumpMeta: Record<string, unknown> = {
+    timestamp: new Date().toISOString(),
+    url: req.url,
+    transform_info: transformInfo,
+  };
+
   const sessionId = resolveSessionId(req.headers);
   if (sessionId !== null) {
     try {
@@ -260,6 +328,10 @@ async function handleMessages(
         getActiveBlocksCached(sessionId),
         getJsonlMessagesCached(sessionId),
       ]);
+
+      dumpMeta["session_id"] = sessionId;
+      dumpMeta["active_block_ids"] = activeBlocks.map((b) => b.block_id);
+      dumpMeta["jsonl_message_count"] = jsonlMessages.length;
 
       if (activeBlocks.length > 0) {
         const parsed = JSON.parse(bodyBuf.toString("utf-8"));
@@ -274,6 +346,12 @@ async function handleMessages(
             `applied blocks=[${result.blocks_applied.join(",")}] ` +
             `substituted=${result.anchors_substituted} ` +
             `dropped=${result.messages_dropped}`;
+          dumpMeta["request_message_count"] = parsed.messages.length;
+          dumpMeta["transformed_message_count"] = result.request.messages.length;
+          dumpMeta["blocks_applied"] = result.blocks_applied;
+          dumpMeta["blocks_inactive_in_request"] = result.blocks_inactive_in_request;
+          dumpMeta["anchors_substituted"] = result.anchors_substituted;
+          dumpMeta["messages_dropped"] = result.messages_dropped;
         } else {
           transformInfo = "passthrough (no messages array)";
         }
@@ -289,12 +367,22 @@ async function handleMessages(
       );
       modifiedBuf = bodyBuf;
       transformInfo = "passthrough (transform error)";
+      dumpMeta["transform_error"] =
+        err instanceof Error ? err.message : String(err);
     }
   } else {
     transformInfo = "passthrough (no session id)";
   }
 
+  dumpMeta["transform_info"] = transformInfo;
+  dumpMeta["body_changed"] = modifiedBuf !== bodyBuf;
+
   log("debug", `POST /v1/messages session=${sessionId ?? "?"} ${transformInfo}`);
+
+  // Dump if configured. Done before forwarding so we capture even if upstream errors.
+  if (config.dumpDir !== undefined) {
+    void writeDump(config.dumpDir, dumpMeta, bodyBuf, modifiedBuf, log);
+  }
 
   const upstreamUrl = new URL(req.url ?? "/", config.upstream);
 

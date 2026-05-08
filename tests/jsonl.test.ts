@@ -106,6 +106,52 @@ test("parseSessionJsonl handles array-form content", async () => {
   assert.deepEqual(messages[0]?.content, arrayContent);
 });
 
+test("parseSessionJsonl synthesizes Read-tool messages from attachment records", async () => {
+  const path = await writeJsonl("-test", "s1", [
+    {
+      type: "attachment",
+      uuid: "att1",
+      attachment: {
+        type: "file",
+        filename: "/tmp/example.md",
+        content: {
+          type: "text",
+          file: {
+            filePath: "/tmp/example.md",
+            content: "# Title\nBody",
+            startLine: 1,
+            numLines: 2,
+            totalLines: 2,
+          },
+        },
+        displayPath: "example.md",
+      },
+    },
+  ]);
+
+  const messages = await parseSessionJsonl(path);
+  assert.equal(messages.length, 2);
+  assert.equal(messages[0]?.uuid, "att1");
+  assert.equal(messages[0]?.role, "user");
+  assert.equal(
+    messages[0]?.content,
+    '<system-reminder>\nCalled the Read tool with the following input: {"file_path":"/tmp/example.md"}\n</system-reminder>',
+  );
+  assert.equal(messages[1]?.uuid, "att1");
+  assert.equal(messages[1]?.role, "user");
+  assert.deepEqual(messages[1]?.content, [
+    {
+      type: "text",
+      text:
+        "<system-reminder>\n" +
+        "Result of calling the Read tool:\n" +
+        "1\t# Title\n" +
+        "2\tBody\n" +
+        "</system-reminder>",
+    },
+  ]);
+});
+
 test("parseSessionJsonl skips invalid lines silently", async () => {
   const path = join(tempRoot, "-test", "s1.jsonl");
   await mkdir(join(tempRoot, "-test"), { recursive: true });

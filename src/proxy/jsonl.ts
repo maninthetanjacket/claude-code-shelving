@@ -74,10 +74,15 @@ export async function parseSessionJsonl(path: string): Promise<JsonlMessage[]> {
     const e = entry as Record<string, unknown>;
 
     const type = e["type"];
-    if (type !== "user" && type !== "assistant") continue;
-
     const uuid = e["uuid"];
     if (typeof uuid !== "string" || uuid.length === 0) continue;
+
+    if (type === "attachment") {
+      messages.push(...parseAttachmentEntry(e, uuid));
+      continue;
+    }
+
+    if (type !== "user" && type !== "assistant") continue;
 
     const message = e["message"];
     if (typeof message !== "object" || message === null) continue;
@@ -93,6 +98,75 @@ export async function parseSessionJsonl(path: string): Promise<JsonlMessage[]> {
   }
 
   return messages;
+}
+
+function parseAttachmentEntry(
+  entry: Record<string, unknown>,
+  uuid: string,
+): JsonlMessage[] {
+  const attachment = entry["attachment"];
+  if (typeof attachment !== "object" || attachment === null) return [];
+  const a = attachment as Record<string, unknown>;
+
+  if (a["type"] !== "file") return [];
+  const filename = a["filename"];
+  const content = a["content"];
+  if (typeof filename !== "string" || typeof content !== "object" || content === null) {
+    return [];
+  }
+
+  const contentRecord = content as Record<string, unknown>;
+  if (contentRecord["type"] !== "text") return [];
+
+  const file = contentRecord["file"];
+  if (typeof file !== "object" || file === null) return [];
+  const fileRecord = file as Record<string, unknown>;
+
+  const filePath = fileRecord["filePath"];
+  const fileContent = fileRecord["content"];
+  const startLine = fileRecord["startLine"];
+  if (
+    typeof filePath !== "string" ||
+    typeof fileContent !== "string" ||
+    typeof startLine !== "number"
+  ) {
+    return [];
+  }
+
+  const numbered = formatAttachmentFileContent(fileContent, startLine);
+
+  return [
+    {
+      uuid,
+      role: "user",
+      content:
+        `<system-reminder>\n` +
+        `Called the Read tool with the following input: ` +
+        `${JSON.stringify({ file_path: filePath })}\n` +
+        `</system-reminder>`,
+    },
+    {
+      uuid,
+      role: "user",
+      content: [
+        {
+          type: "text",
+          text:
+            `<system-reminder>\n` +
+            `Result of calling the Read tool:\n` +
+            `${numbered}\n` +
+            `</system-reminder>`,
+        },
+      ],
+    },
+  ];
+}
+
+function formatAttachmentFileContent(content: string, startLine: number): string {
+  const lines = content.split("\n");
+  return lines
+    .map((line, idx) => `${startLine + idx}\t${line}`)
+    .join("\n");
 }
 
 /**

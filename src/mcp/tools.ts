@@ -15,6 +15,7 @@ import {
   resolveSessionIdArg,
   ValidationError,
 } from "./validate.js";
+import { loadSessionMessages } from "../proxy/jsonl.js";
 
 /**
  * Tool definitions and handlers for the shelving MCP server.
@@ -198,6 +199,11 @@ export async function handleCompress(args: unknown): Promise<ToolResult> {
     return errorResult("compressed_uuids must contain at least one UUID");
   }
 
+  const validationError = await validateCompressedRange(sessionId, compressedUuids);
+  if (validationError !== null) {
+    return errorResult(validationError);
+  }
+
   const block: Block = {
     block_id: blockId,
     created_at: new Date().toISOString(),
@@ -221,6 +227,80 @@ export async function handleCompress(args: unknown): Promise<ToolResult> {
     summary_tokens: block.summary_tokens,
     active: true,
   });
+}
+
+async function validateCompressedRange(
+  sessionId: string,
+  compressedUuids: string[],
+): Promise<string | null> {
+  const { path, messages } = await loadSessionMessages(sessionId);
+  if (path === null) {
+    return `Session JSONL not found for session ${sessionId}`;
+  }
+
+  const expandedUuidStream = collapseConsecutiveDuplicates(
+    messages.map((message) => message.uuid),
+  );
+  const uuidToIndex = new Map<string, number>();
+  for (let i = 0; i < expandedUuidStream.length; i++) {
+    const uuid = expandedUuidStream[i];
+    if (uuid !== undefined && !uuidToIndex.has(uuid)) {
+      uuidToIndex.set(uuid, i);
+    }
+  }
+
+  const seen = new Set<string>();
+  for (const uuid of compressedUuids) {
+    if (seen.has(uuid)) {
+      return `compressed_uuids contains duplicate UUID ${uuid}`;
+    }
+    seen.add(uuid);
+    if (!uuidToIndex.has(uuid)) {
+      return `compressed_uuids contains UUID ${uuid} that was not found in session ${sessionId}`;
+    }
+  }
+
+  const firstUuid = compressedUuids[0];
+  const lastUuid = compressedUuids[compressedUuids.length - 1];
+  if (firstUuid === undefined || lastUuid === undefined) {
+    return "compressed_uuids must contain at least one UUID";
+  }
+  const start = uuidToIndex.get(firstUuid);
+  const end = uuidToIndex.get(lastUuid);
+  if (start === undefined || end === undefined) {
+    return "compressed_uuids could not be aligned to the session JSONL";
+  }
+  if (start > end) {
+    return "compressed_uuids must be ordered chronologically";
+  }
+
+  const expectedRange = expandedUuidStream.slice(start, end + 1);
+  if (expectedRange.length !== compressedUuids.length) {
+    return (
+      "compressed_uuids must describe a contiguous range in the session JSONL " +
+      `(expected ${JSON.stringify(expectedRange)})`
+    );
+  }
+  for (let i = 0; i < compressedUuids.length; i++) {
+    if (compressedUuids[i] !== expectedRange[i]) {
+      return (
+        "compressed_uuids must describe a contiguous range in the session JSONL " +
+        `(expected ${JSON.stringify(expectedRange)})`
+      );
+    }
+  }
+
+  return null;
+}
+
+function collapseConsecutiveDuplicates(values: string[]): string[] {
+  const collapsed: string[] = [];
+  for (const value of values) {
+    if (collapsed[collapsed.length - 1] !== value) {
+      collapsed.push(value);
+    }
+  }
+  return collapsed;
 }
 
 export async function handleDecompress(args: unknown): Promise<ToolResult> {

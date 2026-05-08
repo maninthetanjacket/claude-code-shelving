@@ -96,11 +96,22 @@ export function applySubstitutions(
     };
   }
 
-  // Build content-key → uuid map from the JSONL.
+  // Build exact content-key → uuid map from the JSONL, plus a fragment index
+  // for cases where CC combines multiple logical messages into one API message
+  // or adds transport-only blocks like assistant thinking.
   // If two UUIDs share a content-key, last one wins (rare; documented).
   const keyToUuid = new Map<string, string>();
+  const fragmentKeyToUuids = new Map<string, string[]>();
   for (const m of jsonlMessages) {
     keyToUuid.set(contentKey(m.role, m.content), m.uuid);
+    for (const fragmentKey of fragmentKeys(m.role, m.content)) {
+      const existing = fragmentKeyToUuids.get(fragmentKey);
+      if (existing === undefined) {
+        fragmentKeyToUuids.set(fragmentKey, [m.uuid]);
+      } else if (!existing.includes(m.uuid)) {
+        existing.push(m.uuid);
+      }
+    }
   }
 
   // Build uuid → block lookup for each active block, plus uuid → role-in-block.
@@ -122,28 +133,52 @@ export function applySubstitutions(
   let messagesDropped = 0;
 
   for (const apiMsg of request.messages) {
-    const key = contentKey(apiMsg.role, apiMsg.content);
-    const uuid = keyToUuid.get(key);
-    if (uuid === undefined) {
+    const matchedUuids = resolveMessageUuids(apiMsg, keyToUuid, fragmentKeyToUuids);
+    if (matchedUuids.length === 0) {
       // Not found in JSONL (could be a system-injected message or content
       // that CC transformed before sending). Pass through.
       newMessages.push(apiMsg);
       continue;
     }
-    const hit = uuidToBlock.get(uuid);
-    if (hit === undefined) {
+
+    const blockHits = matchedUuids
+      .map((uuid) => ({ uuid, hit: uuidToBlock.get(uuid) }))
+      .filter(
+        (entry): entry is { uuid: string; hit: { block: Block; role: Role } } =>
+          entry.hit !== undefined,
+      );
+
+    if (blockHits.length === 0) {
       // UUID exists in JSONL but not in any active block. Pass through.
       newMessages.push(apiMsg);
       continue;
     }
-    blocksApplied.add(hit.block.block_id);
-    if (hit.role === "anchor") {
+
+    const blockIds = new Set(blockHits.map((entry) => entry.hit.block.block_id));
+    if (blockIds.size > 1) {
+      // Ambiguous: this API message appears to contain content from multiple
+      // blocks. Fail safe to passthrough rather than risking a wrong rewrite.
+      newMessages.push(apiMsg);
+      continue;
+    }
+
+    const blockHit = blockHits[0];
+    if (blockHit === undefined) {
+      newMessages.push(apiMsg);
+      continue;
+    }
+
+    const block = blockHit.hit.block;
+    const containsAnchor = blockHits.some((entry) => entry.hit.role === "anchor");
+
+    blocksApplied.add(block.block_id);
+    if (containsAnchor) {
       // Substitute content with the block's summary.
       // Use a single user-role text message containing the summary, prefixed
       // with a marker so the model can recognize the substitution.
       newMessages.push({
         role: apiMsg.role,
-        content: formatSummaryContent(hit.block, apiMsg.content),
+        content: formatSummaryContent(block, apiMsg.content),
       });
       anchorsSubstituted++;
     } else {
@@ -176,10 +211,84 @@ export function applySubstitutions(
  * we don't depend on key reordering here).
  */
 function contentKey(role: string, content: string | unknown[]): string {
-  if (typeof content === "string") {
-    return `${role}:s:${content}`;
+  const normalized = normalizeContent(content);
+  if (typeof normalized === "string") {
+    return `${role}:s:${normalized}`;
   }
-  return `${role}:a:${JSON.stringify(content)}`;
+  return `${role}:a:${JSON.stringify(normalized)}`;
+}
+
+function fragmentKeys(role: string, content: string | unknown[]): string[] {
+  const normalized = normalizeContent(content);
+  if (typeof normalized === "string") {
+    return [`${role}:f:${normalized}`];
+  }
+  const keys: string[] = [];
+  for (const block of normalized) {
+    if (typeof block !== "object" || block === null) continue;
+    const record = block as Record<string, unknown>;
+    if (record["type"] !== "text") continue;
+    const text = record["text"];
+    if (typeof text !== "string") continue;
+    keys.push(`${role}:f:${text}`);
+  }
+  return keys;
+}
+
+function resolveMessageUuids(
+  message: ApiMessage,
+  keyToUuid: Map<string, string>,
+  fragmentKeyToUuids: Map<string, string[]>,
+): string[] {
+  const exact = keyToUuid.get(contentKey(message.role, message.content));
+  if (exact !== undefined) {
+    return [exact];
+  }
+
+  if (!Array.isArray(message.content)) {
+    return [];
+  }
+
+  const matched = new Set<string>();
+  for (const fragmentKey of fragmentKeys(message.role, message.content)) {
+    const uuids = fragmentKeyToUuids.get(fragmentKey);
+    if (uuids === undefined) continue;
+    for (const uuid of uuids) matched.add(uuid);
+  }
+  return Array.from(matched);
+}
+
+function normalizeContent(content: string | unknown[]): string | unknown[] {
+  if (typeof content === "string") {
+    return trimSingleTrailingNewline(content);
+  }
+  const normalized: unknown[] = [];
+  for (const block of content) {
+    if (typeof block !== "object" || block === null) {
+      normalized.push(block);
+      continue;
+    }
+
+    const record = block as Record<string, unknown>;
+    if (record["type"] === "thinking") {
+      continue;
+    }
+
+    if (record["type"] === "text" && typeof record["text"] === "string") {
+      normalized.push({
+        ...record,
+        text: trimSingleTrailingNewline(record["text"]),
+      });
+      continue;
+    }
+
+    normalized.push(block);
+  }
+  return normalized;
+}
+
+function trimSingleTrailingNewline(text: string): string {
+  return text.endsWith("\n") ? text.slice(0, -1) : text;
 }
 
 /**
