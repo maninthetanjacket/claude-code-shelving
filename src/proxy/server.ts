@@ -25,10 +25,16 @@
 
 import {
   createServer as createHttpServer,
+  request as httpRequest,
+  type ClientRequest,
+  type IncomingHttpHeaders,
   type IncomingMessage,
+  type RequestOptions,
   type Server,
   type ServerResponse,
 } from "node:http";
+import { request as httpsRequest } from "node:https";
+import { once } from "node:events";
 import { applySubstitutions } from "./transform.js";
 import { getActiveBlocksCached, getJsonlMessagesCached } from "./cache.js";
 
@@ -61,6 +67,10 @@ function makeLogger(level: ProxyConfig["logLevel"]) {
     if (which === "debug" && level !== "debug") return;
     process.stderr.write(`[shelving-proxy] ${msg}\n`);
   };
+}
+
+function requestPathname(reqUrl: string | undefined): string {
+  return new URL(reqUrl ?? "/", "http://placeholder").pathname;
 }
 
 // ---------------------------------------------------------------------------
@@ -116,6 +126,7 @@ const HOP_BY_HOP = new Set([
 function buildUpstreamHeaders(
   reqHeaders: IncomingMessage["headers"],
   newBodyLength: number | null,
+  upstreamHostname: string,
 ): Record<string, string> {
   const out: Record<string, string> = {};
   for (const [k, v] of Object.entries(reqHeaders)) {
@@ -123,6 +134,10 @@ function buildUpstreamHeaders(
     if (HOP_BY_HOP.has(k.toLowerCase())) continue;
     out[k] = Array.isArray(v) ? v.join(", ") : String(v);
   }
+  out["host"] = upstreamHostname;
+  // Force plaintext so stream framing stays stable for downstream clients and
+  // for any future SSE-aware proxy logic.
+  out["accept-encoding"] = "identity";
   if (newBodyLength !== null) {
     out["content-length"] = String(newBodyLength);
   }
@@ -130,31 +145,90 @@ function buildUpstreamHeaders(
 }
 
 function buildResponseHeaders(
-  upstream: Response,
+  upstreamHeaders: IncomingHttpHeaders,
 ): Record<string, string | string[]> {
   const out: Record<string, string | string[]> = {};
-  upstream.headers.forEach((value, key) => {
-    const lower = key.toLowerCase();
-    // fetch() transparently decodes compressed upstream responses, so forwarding
-    // the original encoding/length headers would make downstream clients try to
-    // decode an already-decoded body.
-    if (
-      lower === "transfer-encoding" ||
-      lower === "content-encoding" ||
-      lower === "content-length"
-    ) {
-      return;
-    }
-    const existing = out[key];
-    if (existing === undefined) {
-      out[key] = value;
-    } else if (Array.isArray(existing)) {
-      existing.push(value);
+  for (const [key, value] of Object.entries(upstreamHeaders)) {
+    if (value === undefined) continue;
+    if (key.toLowerCase() === "transfer-encoding") continue;
+    if (Array.isArray(value)) {
+      out[key] = value.map(String);
     } else {
-      out[key] = [existing, value];
+      out[key] = String(value);
+    }
+  }
+  return out;
+}
+
+interface ForwardedResponse {
+  upstreamRes: IncomingMessage;
+  statusCode: number;
+  responseHeaders: Record<string, string | string[]>;
+}
+
+function forwardUpstream(
+  req: IncomingMessage,
+  upstreamUrl: URL,
+  headers: Record<string, string>,
+  body: Buffer | undefined,
+  signal?: AbortSignal,
+): Promise<ForwardedResponse> {
+  return new Promise((resolve, reject) => {
+    const isHttps = upstreamUrl.protocol === "https:";
+    const requestImpl = isHttps ? httpsRequest : httpRequest;
+    const options: RequestOptions = {
+      protocol: upstreamUrl.protocol,
+      hostname: upstreamUrl.hostname,
+      port:
+        upstreamUrl.port.length > 0
+          ? Number.parseInt(upstreamUrl.port, 10)
+          : isHttps
+            ? 443
+            : 80,
+      path: `${upstreamUrl.pathname}${upstreamUrl.search}`,
+      method: req.method ?? "GET",
+      headers,
+    };
+
+    const upstreamReq: ClientRequest = requestImpl(options, (upstreamRes) => {
+      resolve({
+        upstreamRes,
+        statusCode: upstreamRes.statusCode ?? 502,
+        responseHeaders: buildResponseHeaders(upstreamRes.headers),
+      });
+    });
+
+    upstreamReq.on("error", reject);
+
+    if (signal !== undefined) {
+      signal.addEventListener(
+        "abort",
+        () => {
+          upstreamReq.destroy(new Error("Request aborted"));
+        },
+        { once: true },
+      );
+    }
+
+    if (body !== undefined) {
+      upstreamReq.end(body);
+    } else {
+      upstreamReq.end();
     }
   });
-  return out;
+}
+
+async function pipeUpstreamResponse(
+  upstreamRes: IncomingMessage,
+  res: ServerResponse,
+): Promise<void> {
+  for await (const chunk of upstreamRes) {
+    const ok = res.write(chunk);
+    if (!ok) {
+      await once(res, "drain");
+    }
+  }
+  res.end();
 }
 
 // ---------------------------------------------------------------------------
@@ -167,6 +241,14 @@ async function handleMessages(
   config: ProxyConfig,
   log: ReturnType<typeof makeLogger>,
 ): Promise<void> {
+  const abortController = new AbortController();
+  const abortUpstream = () => {
+    if (!res.writableEnded) abortController.abort();
+  };
+  req.on("aborted", abortUpstream);
+  req.on("close", abortUpstream);
+  res.on("close", abortUpstream);
+
   const bodyBuf = await readBody(req);
   let modifiedBuf = bodyBuf;
   let transformInfo = "passthrough";
@@ -214,32 +296,23 @@ async function handleMessages(
 
   log("debug", `POST /v1/messages session=${sessionId ?? "?"} ${transformInfo}`);
 
-  const upstreamUrl = new URL("/v1/messages", config.upstream);
-  const reqUrl = new URL(req.url ?? "/", "http://placeholder");
-  for (const [k, v] of reqUrl.searchParams.entries()) {
-    upstreamUrl.searchParams.append(k, v);
-  }
+  const upstreamUrl = new URL(req.url ?? "/", config.upstream);
 
-  const upstreamHeaders = buildUpstreamHeaders(req.headers, modifiedBuf.length);
+  const upstreamHeaders = buildUpstreamHeaders(
+    req.headers,
+    modifiedBuf.length,
+    upstreamUrl.hostname,
+  );
 
-  const upstreamRes = await fetch(upstreamUrl, {
-    method: "POST",
-    headers: upstreamHeaders,
-    body: new Uint8Array(modifiedBuf),
-  });
-
-  const respHeaders = buildResponseHeaders(upstreamRes);
-  res.writeHead(upstreamRes.status, respHeaders);
-
-  if (upstreamRes.body !== null) {
-    const reader = upstreamRes.body.getReader();
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      if (value !== undefined) res.write(Buffer.from(value));
-    }
-  }
-  res.end();
+  const upstream = await forwardUpstream(
+    req,
+    upstreamUrl,
+    upstreamHeaders,
+    modifiedBuf,
+    abortController.signal,
+  );
+  res.writeHead(upstream.statusCode, upstream.responseHeaders);
+  await pipeUpstreamResponse(upstream.upstreamRes, res);
 }
 
 // ---------------------------------------------------------------------------
@@ -251,30 +324,32 @@ async function handlePassthrough(
   res: ServerResponse,
   config: ProxyConfig,
 ): Promise<void> {
+  const abortController = new AbortController();
+  const abortUpstream = () => {
+    if (!res.writableEnded) abortController.abort();
+  };
+  req.on("aborted", abortUpstream);
+  req.on("close", abortUpstream);
+  res.on("close", abortUpstream);
+
   const upstreamUrl = new URL(req.url ?? "/", config.upstream);
   const bodyBuf =
     req.method === "GET" || req.method === "HEAD" ? undefined : await readBody(req);
   const upstreamHeaders = buildUpstreamHeaders(
     req.headers,
     bodyBuf ? bodyBuf.length : null,
+    upstreamUrl.hostname,
   );
 
-  const upstreamRes = await fetch(upstreamUrl, {
-    method: req.method ?? "GET",
-    headers: upstreamHeaders,
-    body: bodyBuf === undefined ? undefined : new Uint8Array(bodyBuf),
-  });
-  const respHeaders = buildResponseHeaders(upstreamRes);
-  res.writeHead(upstreamRes.status, respHeaders);
-  if (upstreamRes.body !== null) {
-    const reader = upstreamRes.body.getReader();
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      if (value !== undefined) res.write(Buffer.from(value));
-    }
-  }
-  res.end();
+  const upstream = await forwardUpstream(
+    req,
+    upstreamUrl,
+    upstreamHeaders,
+    bodyBuf,
+    abortController.signal,
+  );
+  res.writeHead(upstream.statusCode, upstream.responseHeaders);
+  await pipeUpstreamResponse(upstream.upstreamRes, res);
 }
 
 // ---------------------------------------------------------------------------
@@ -285,6 +360,8 @@ export function createProxyServer(config: ProxyConfig): Server {
   const log = makeLogger(config.logLevel);
 
   return createHttpServer((req, res) => {
+    const pathname = requestPathname(req.url);
+
     if (req.url === "/health" && req.method === "GET") {
       res.writeHead(200, { "content-type": "application/json" });
       res.end(
@@ -294,7 +371,7 @@ export function createProxyServer(config: ProxyConfig): Server {
     }
 
     const handler =
-      req.method === "POST" && req.url?.startsWith("/v1/messages")
+      req.method === "POST" && pathname === "/v1/messages"
         ? (r: IncomingMessage, w: ServerResponse) =>
             handleMessages(r, w, config, log)
         : (r: IncomingMessage, w: ServerResponse) =>

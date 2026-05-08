@@ -217,6 +217,7 @@ test("E2E: passthrough when no session header", async () => {
 
     assert.equal(upstream.captured.length, 1);
     assert.equal(upstream.captured[0]?.body, reqBody);
+    assert.equal(upstream.captured[0]?.headers["accept-encoding"], "identity");
   } finally {
     await proxy.close();
     await upstream.close();
@@ -241,6 +242,7 @@ test("E2E: passthrough when no active blocks for session", async () => {
     });
     assert.equal(res.status, 200);
     assert.equal(upstream.captured[0]?.body, reqBody);
+    assert.equal(upstream.captured[0]?.headers["accept-encoding"], "identity");
   } finally {
     await proxy.close();
     await upstream.close();
@@ -269,8 +271,8 @@ test("E2E: gzipped upstream responses are decoded once for downstream clients", 
     });
 
     assert.equal(res.status, 200);
-    assert.equal(res.headers.get("content-encoding"), null);
     assert.equal(await res.text(), plainBody);
+    assert.equal(upstream.captured[0]?.headers["accept-encoding"], "identity");
   } finally {
     await proxy.close();
     await upstream.close();
@@ -556,6 +558,52 @@ test("E2E: non-/v1/messages endpoints pass through to upstream", async () => {
     assert.equal(res.status, 200);
     assert.equal(upstream.captured.length, 1);
     assert.equal(upstream.captured[0]?.url, "/v1/some-other-endpoint");
+    assert.equal(upstream.captured[0]?.headers["accept-encoding"], "identity");
+  } finally {
+    await proxy.close();
+    await upstream.close();
+  }
+});
+
+test("E2E: /v1/messages subpaths pass through unchanged and preserve path", async () => {
+  await writeSessionJsonl(SESSION_ID, [
+    { uuid: "u1", role: "user", content: "msg1" },
+    { uuid: "u2", role: "assistant", content: "msg2" },
+  ]);
+  await writeBlock(
+    SESSION_ID,
+    makeBlock({
+      block_id: 1,
+      anchor_uuid: "u1",
+      compressed_uuids: ["u1", "u2"],
+      summary: "Collapsed.",
+    }),
+  );
+
+  const upstream = await startFakeUpstream();
+  const proxy = await startProxy(upstream.url);
+  try {
+    const reqBody = JSON.stringify({
+      model: "claude-opus-4.7",
+      messages: [
+        { role: "user", content: "msg1" },
+        { role: "assistant", content: "msg2" },
+      ],
+    });
+
+    const res = await fetch(new URL("/v1/messages/count_tokens?beta=true", proxy.url), {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-claude-code-session-id": SESSION_ID,
+      },
+      body: reqBody,
+    });
+
+    assert.equal(res.status, 200);
+    assert.equal(upstream.captured.length, 1);
+    assert.equal(upstream.captured[0]?.url, "/v1/messages/count_tokens?beta=true");
+    assert.equal(upstream.captured[0]?.body, reqBody);
   } finally {
     await proxy.close();
     await upstream.close();
