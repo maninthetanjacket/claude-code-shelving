@@ -11,7 +11,11 @@
     "test": "node --test --import tsx tests/*.test.ts",
     "test:registry": "node --test --import tsx tests/registry.test.ts",
     "mcp": "tsx src/mcp/server.ts",
-    "proxy": "tsx src/proxy/server.ts"
+    "proxy": "tsx src/proxy/server.ts",
+    "find-arc": "tsx src/cli/find-arc.ts"
+  },
+  "bin": {
+    "shelving-find-arc": "dist/cli/find-arc.js"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.0"

@@ -138,7 +138,24 @@ The session UUID is preserved across `--resume`, so any registry state under `~/
 
 ### Finding messages to compress
 
-The model reads the session JSONL to find UUIDs:
+Two paths: assistive CLI for the common case, manual JSONL inspection for everything else.
+
+**Assistive CLI: `find-arc`.** Surfaces candidate UUID ranges given a topic phrase. Doesn't decide what to shelve — narrows the search space.
+
+```bash
+node dist/cli/find-arc.js <session-id> "topic phrase" [options]
+```
+
+Options:
+- `--limit N` — show top-N candidates (default: 5)
+- `--context M` — expand each arc by up to M turns on each side (default: 1)
+- `--format text|json` — output format (default: text)
+
+Matching strategies, in preference order: exact phrase → all words within an arc → any word. Output includes first/last UUIDs, full UUID list, turn count, estimated tokens, and previews. For tool-only turns where text is unavailable, previews fall back to type tags like `[user · tool_result]`.
+
+The model uses this to find candidate boundaries, then confirms them by inspecting context, then calls `compress`. Inspection-as-judgment stays with the model; inspection-as-mechanics is delegated.
+
+**Manual fallback.** When `find-arc` doesn't fit (no clear topic phrase, complex boundaries):
 
 ```bash
 ls ~/.claude/projects/                                 # find project slug
