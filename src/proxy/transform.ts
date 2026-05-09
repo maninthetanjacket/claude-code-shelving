@@ -16,6 +16,10 @@ import type { Block } from "../shared/types.js";
  * UUID→content map to recover its UUID, then check membership in active
  * blocks.
  *
+ * Both sides go through `normalizeContent` before matching. See the comment
+ * on that function for the canonicalization invariants — the matcher is
+ * "same logical message," not "same bytes."
+ *
  * Cache stability: this function is deterministic given the same inputs.
  * Same registry + same JSONL state = same output bytes.
  */
@@ -258,6 +262,60 @@ function resolveMessageUuids(
   return Array.from(matched);
 }
 
+/**
+ * Canonicalize a message's content for matching.
+ *
+ * The matcher's invariant is **same logical message, not same bytes**. JSONL
+ * and the live API request body represent the same conceptual content with
+ * small structural differences — different layers add or strip metadata that
+ * doesn't change meaning. This function removes those differences so equal
+ * messages compare equal.
+ *
+ * Each rule below is here because a real bug surfaced from drift between the
+ * two representations. New rules should follow the same pattern: add the
+ * rule, document the symptom that motivated it, and add a regression test in
+ * `tests/transform.test.ts`.
+ *
+ * Rules currently applied:
+ *
+ * 1. **Drop `thinking` blocks.** The API request body may contain assistant
+ *    reasoning/thinking content blocks that aren't persisted in JSONL. They
+ *    aren't part of the logical message exchange — they're transport-layer
+ *    metadata for the model's chain-of-thought.
+ *    Symptom: assistant messages with thinking failed to match their
+ *    JSONL counterparts because the request had blocks JSONL didn't.
+ *
+ * 2. **Trim a single trailing newline** on raw text content and on `text`
+ *    blocks. Some encoding paths add a terminal newline; comparing them
+ *    byte-equal would falsely diverge.
+ *    Symptom: matches missed by a single trailing `\n`.
+ *
+ * 3. **Strip harness-injected `<system-reminder>` from `tool_result.content`.**
+ *    When CC observes a side effect (e.g., a file edit) it may append a
+ *    `\n\n<system-reminder>...</system-reminder>` to the next user
+ *    `tool_result` it sends to the API. JSONL records only the bare tool
+ *    output. Without stripping the reminder, the user message fails to
+ *    match, its paired assistant `tool_use` is left orphaned, and Anthropic
+ *    rejects the request with a tool-pairing error.
+ *    Symptom: 400 from the API after editing files inside a compressed
+ *    range.
+ *
+ * 4. **Reduce `tool_use` blocks to {type, id, name, input}.** JSONL stores
+ *    assistant `tool_use` blocks with extra fields (notably `caller`) that
+ *    the API request body omits. Including those fields in the comparison
+ *    key makes equal blocks compare unequal — and asymmetrically: the user
+ *    `tool_result` may match while its paired assistant `tool_use` does not,
+ *    leaving an orphaned `tool_use` and producing the same kind of pairing
+ *    error.
+ *    Symptom: "tool use concurrency" errors after compressing a range
+ *    containing multiple tool calls.
+ *
+ * Note that this function is used on **both** sides of the comparison —
+ * request messages and JSONL messages both pass through it before their
+ * keys are computed. Adding a new normalization rule therefore tightens the
+ * matcher symmetrically; it can't accidentally make one side stricter than
+ * the other.
+ */
 function normalizeContent(content: string | unknown[]): string | unknown[] {
   if (typeof content === "string") {
     return trimSingleTrailingNewline(content);
@@ -271,6 +329,16 @@ function normalizeContent(content: string | unknown[]): string | unknown[] {
 
     const record = block as Record<string, unknown>;
     if (record["type"] === "thinking") {
+      continue;
+    }
+
+    if (record["type"] === "tool_result") {
+      normalized.push(normalizeToolResultBlock(record));
+      continue;
+    }
+
+    if (record["type"] === "tool_use") {
+      normalized.push(normalizeToolUseBlock(record));
       continue;
     }
 
@@ -289,6 +357,36 @@ function normalizeContent(content: string | unknown[]): string | unknown[] {
 
 function trimSingleTrailingNewline(text: string): string {
   return text.endsWith("\n") ? text.slice(0, -1) : text;
+}
+
+function normalizeToolResultBlock(
+  block: Record<string, unknown>,
+): Record<string, unknown> {
+  const content = block["content"];
+  if (typeof content !== "string") {
+    return block;
+  }
+  return {
+    ...block,
+    content: stripInjectedSystemReminder(trimSingleTrailingNewline(content)),
+  };
+}
+
+function normalizeToolUseBlock(
+  block: Record<string, unknown>,
+): Record<string, unknown> {
+  return {
+    type: block["type"],
+    id: block["id"],
+    name: block["name"],
+    input: block["input"],
+  };
+}
+
+function stripInjectedSystemReminder(text: string): string {
+  const match = text.match(/\n\n<system-reminder>\n[\s\S]*<\/system-reminder>$/);
+  if (match === null) return text;
+  return text.slice(0, match.index);
 }
 
 /**

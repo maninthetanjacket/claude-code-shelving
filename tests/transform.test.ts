@@ -308,6 +308,169 @@ test("combined attachment result plus prompt and assistant thinking still match 
   assert.deepEqual(result.blocks_applied, [1]);
 });
 
+test("tool_result with trailing injected system reminder still matches its JSONL uuid", () => {
+  const request = makeRequest([
+    {
+      role: "assistant",
+      content: [
+        { type: "text", text: "Let me write the corrected block:" },
+        {
+          type: "tool_use",
+          id: "toolu_fix",
+          name: "Bash",
+          input: { command: "cat > /tmp/block-1-fix.json ..." },
+        },
+      ],
+    },
+    {
+      role: "user",
+      content: [
+        {
+          tool_use_id: "toolu_fix",
+          type: "tool_result",
+          content:
+            "{\n  \"block_id\": 1,\n  \"active\": true\n}\n\n" +
+            "<system-reminder>\n" +
+            "Note: /tmp/block-1-fix.json was modified, either by the user or by a linter.\n" +
+            "</system-reminder>",
+          is_error: false,
+        },
+      ],
+    },
+    {
+      role: "assistant",
+      content: [{ type: "text", text: "Registry now has the corrected UUIDs." }],
+    },
+  ]);
+
+  const jsonl: JsonlMessage[] = [
+    {
+      uuid: "u1",
+      role: "assistant",
+      content: [
+        { type: "text", text: "Let me write the corrected block:" },
+        {
+          type: "tool_use",
+          id: "toolu_fix",
+          name: "Bash",
+          input: { command: "cat > /tmp/block-1-fix.json ..." },
+        },
+      ],
+    },
+    {
+      uuid: "u2",
+      role: "user",
+      content: [
+        {
+          tool_use_id: "toolu_fix",
+          type: "tool_result",
+          content: "{\n  \"block_id\": 1,\n  \"active\": true\n}",
+          is_error: false,
+        },
+      ],
+    },
+    {
+      uuid: "u3",
+      role: "assistant",
+      content: [{ type: "text", text: "Registry now has the corrected UUIDs." }],
+    },
+  ];
+  const block = makeBlock({
+    anchor_uuid: "u1",
+    compressed_uuids: ["u1", "u2", "u3"],
+    summary: "Collapsed block-fix exchange.",
+  });
+
+  const result = applySubstitutions(request, jsonl, [block]);
+  assert.equal(result.request.messages.length, 1);
+  assert.match(
+    result.request.messages[0]?.content as string,
+    /Collapsed block-fix exchange\./,
+  );
+  assert.equal(result.anchors_substituted, 1);
+  assert.equal(result.messages_dropped, 2);
+  assert.deepEqual(result.blocks_applied, [1]);
+});
+
+test("tool_use still matches when JSONL includes caller metadata but request omits it", () => {
+  const request = makeRequest([
+    {
+      role: "assistant",
+      content: [
+        {
+          type: "tool_use",
+          id: "toolu_fix",
+          name: "Bash",
+          input: { command: "ls src/shared/" },
+        },
+      ],
+    },
+    {
+      role: "user",
+      content: [
+        {
+          tool_use_id: "toolu_fix",
+          type: "tool_result",
+          content: "paths.ts\nregistry.ts\ntypes.ts",
+          is_error: false,
+        },
+      ],
+    },
+    {
+      role: "assistant",
+      content: [{ type: "text", text: "Now I know what's in src/shared." }],
+    },
+  ]);
+
+  const jsonl: JsonlMessage[] = [
+    {
+      uuid: "u1",
+      role: "assistant",
+      content: [
+        {
+          type: "tool_use",
+          id: "toolu_fix",
+          name: "Bash",
+          input: { command: "ls src/shared/" },
+          caller: { type: "direct" },
+        },
+      ],
+    },
+    {
+      uuid: "u2",
+      role: "user",
+      content: [
+        {
+          tool_use_id: "toolu_fix",
+          type: "tool_result",
+          content: "paths.ts\nregistry.ts\ntypes.ts",
+          is_error: false,
+        },
+      ],
+    },
+    {
+      uuid: "u3",
+      role: "assistant",
+      content: [{ type: "text", text: "Now I know what's in src/shared." }],
+    },
+  ];
+  const block = makeBlock({
+    anchor_uuid: "u1",
+    compressed_uuids: ["u1", "u2", "u3"],
+    summary: "Collapsed tool-use exchange.",
+  });
+
+  const result = applySubstitutions(request, jsonl, [block]);
+  assert.equal(result.request.messages.length, 1);
+  assert.match(
+    result.request.messages[0]?.content as string,
+    /Collapsed tool-use exchange\./,
+  );
+  assert.equal(result.anchors_substituted, 1);
+  assert.equal(result.messages_dropped, 2);
+  assert.deepEqual(result.blocks_applied, [1]);
+});
+
 test("multiple non-overlapping blocks: each applied independently", () => {
   const request = makeRequest([
     { role: "user", content: "a1" },
