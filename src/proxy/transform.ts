@@ -10,11 +10,28 @@ import type { Block } from "../shared/types.js";
  * Output: a modified request body where each compressed range has been
  * collapsed to its summary at the anchor position.
  *
- * Matching strategy: content-based. We can't rely on positional alignment
- * between the JSONL and the API request (CC may strip or transform some
- * entries), so we content-match each request message against the
- * UUID→content map to recover its UUID, then check membership in active
- * blocks.
+ * Matching strategy: content-based, at two granularities.
+ *
+ * Whole-message: each request message is normalized and compared against the
+ * UUID→content map. If a whole message matches, we know its UUID and can
+ * check membership in active blocks.
+ *
+ * Fragment-level: when whole-message matching fails (because CC has combined
+ * multiple JSONL entries into one API message — e.g., thinking + text +
+ * tool_use), each content block is matched individually via
+ * `fragmentKeyForBlock`. This recovers the UUIDs of constituent fragments
+ * even when their containing message has no exact equivalent in JSONL.
+ *
+ * Anchor-seen filter: before substituting, we verify that the block's anchor
+ * UUID was matched somewhere in this request. Without this, a request that
+ * contains only drop-targets (no anchor) could lose them with nothing to
+ * substitute at the anchor position. The filter ensures all-or-nothing
+ * application per block per request.
+ *
+ * Fragment substitution: when an anchor is a fragment inside a larger
+ * assistant message (typical case: tool_use embedded with thinking and
+ * text), `rewriteEmbeddedAnchorContent` substitutes just that fragment in
+ * place. Surrounding thinking and text are preserved.
  *
  * Both sides go through `normalizeContent` before matching. See the comment
  * on that function for the canonicalization invariants — the matcher is
@@ -133,11 +150,28 @@ export function applySubstitutions(
 
   const newMessages: ApiMessage[] = [];
   const blocksApplied = new Set<number>();
+  const anchorSeenByBlockId = new Set<number>();
   let anchorsSubstituted = 0;
   let messagesDropped = 0;
 
-  for (const apiMsg of request.messages) {
-    const matchedUuids = resolveMessageUuids(apiMsg, keyToUuid, fragmentKeyToUuids);
+  const resolvedPerMessage = request.messages.map((apiMsg) =>
+    resolveMessageMatch(apiMsg, keyToUuid, fragmentKeyToUuids),
+  );
+
+  for (const resolved of resolvedPerMessage) {
+    for (const uuid of resolved.matchedUuids) {
+      const hit = uuidToBlock.get(uuid);
+      if (hit?.role === "anchor") {
+        anchorSeenByBlockId.add(hit.block.block_id);
+      }
+    }
+  }
+
+  for (let idx = 0; idx < request.messages.length; idx++) {
+    const apiMsg = request.messages[idx];
+    if (apiMsg === undefined) continue;
+    const resolved = resolvedPerMessage[idx];
+    const matchedUuids = resolved?.matchedUuids ?? [];
     if (matchedUuids.length === 0) {
       // Not found in JSONL (could be a system-injected message or content
       // that CC transformed before sending). Pass through.
@@ -149,7 +183,7 @@ export function applySubstitutions(
       .map((uuid) => ({ uuid, hit: uuidToBlock.get(uuid) }))
       .filter(
         (entry): entry is { uuid: string; hit: { block: Block; role: Role } } =>
-          entry.hit !== undefined,
+          entry.hit !== undefined && anchorSeenByBlockId.has(entry.hit.block.block_id),
       );
 
     if (blockHits.length === 0) {
@@ -177,12 +211,18 @@ export function applySubstitutions(
 
     blocksApplied.add(block.block_id);
     if (containsAnchor) {
+      const rewrittenContent = rewriteEmbeddedAnchorContent(
+        apiMsg,
+        block,
+        resolved,
+        uuidToBlock,
+      );
       // Substitute content with the block's summary.
       // Use a single user-role text message containing the summary, prefixed
       // with a marker so the model can recognize the substitution.
       newMessages.push({
         role: apiMsg.role,
-        content: formatSummaryContent(block, apiMsg.content),
+        content: rewrittenContent ?? formatSummaryContent(block, apiMsg.content),
       });
       anchorsSubstituted++;
     } else {
@@ -229,37 +269,122 @@ function fragmentKeys(role: string, content: string | unknown[]): string[] {
   }
   const keys: string[] = [];
   for (const block of normalized) {
-    if (typeof block !== "object" || block === null) continue;
-    const record = block as Record<string, unknown>;
-    if (record["type"] !== "text") continue;
-    const text = record["text"];
-    if (typeof text !== "string") continue;
-    keys.push(`${role}:f:${text}`);
+    const key = fragmentKeyForBlock(role, block);
+    if (key !== null) keys.push(key);
   }
   return keys;
 }
 
-function resolveMessageUuids(
+interface ResolvedMessageMatch {
+  matchedUuids: string[];
+  exactUuid: string | null;
+  fragmentMatches: string[][];
+}
+
+function resolveMessageMatch(
   message: ApiMessage,
   keyToUuid: Map<string, string>,
   fragmentKeyToUuids: Map<string, string[]>,
-): string[] {
+): ResolvedMessageMatch {
   const exact = keyToUuid.get(contentKey(message.role, message.content));
   if (exact !== undefined) {
-    return [exact];
+    return {
+      matchedUuids: [exact],
+      exactUuid: exact,
+      fragmentMatches: Array.isArray(message.content)
+        ? message.content.map(() => [])
+        : [],
+    };
   }
 
   if (!Array.isArray(message.content)) {
-    return [];
+    return { matchedUuids: [], exactUuid: null, fragmentMatches: [] };
   }
 
   const matched = new Set<string>();
-  for (const fragmentKey of fragmentKeys(message.role, message.content)) {
-    const uuids = fragmentKeyToUuids.get(fragmentKey);
-    if (uuids === undefined) continue;
+  const fragmentMatches = message.content.map((block) => {
+    const key = fragmentKeyForBlock(message.role, block);
+    if (key === null) return [];
+    const uuids = fragmentKeyToUuids.get(key) ?? [];
     for (const uuid of uuids) matched.add(uuid);
+    return uuids;
+  });
+  return {
+    matchedUuids: Array.from(matched),
+    exactUuid: null,
+    fragmentMatches,
+  };
+}
+
+function fragmentKeyForBlock(role: string, block: unknown): string | null {
+  if (typeof block !== "object" || block === null) return null;
+  const record = block as Record<string, unknown>;
+  if (record["type"] === "text") {
+    const text = record["text"];
+    if (typeof text !== "string") return null;
+    return `${role}:f:${trimSingleTrailingNewline(text)}`;
   }
-  return Array.from(matched);
+  if (record["type"] === "tool_use") {
+    return `${role}:f:${JSON.stringify(normalizeToolUseBlock(record))}`;
+  }
+  if (record["type"] === "tool_result") {
+    return `${role}:f:${JSON.stringify(normalizeToolResultBlock(record))}`;
+  }
+  return null;
+}
+
+function rewriteEmbeddedAnchorContent(
+  message: ApiMessage,
+  block: Block,
+  resolved: ResolvedMessageMatch | undefined,
+  uuidToBlock: Map<string, { block: Block; role: "anchor" | "drop" }>,
+): string | unknown[] | null {
+  if (
+    resolved === undefined ||
+    resolved.exactUuid !== null ||
+    !Array.isArray(message.content)
+  ) {
+    return null;
+  }
+
+  let replacedAnchor = false;
+  let touched = false;
+  const rewritten: unknown[] = [];
+
+  for (let i = 0; i < message.content.length; i++) {
+    const originalBlock = message.content[i];
+    const matchedUuids = resolved.fragmentMatches[i] ?? [];
+    const hits = matchedUuids
+      .map((uuid) => uuidToBlock.get(uuid))
+      .filter(
+        (hit): hit is { block: Block; role: "anchor" | "drop" } =>
+          hit !== undefined && hit.block.block_id === block.block_id,
+      );
+
+    if (hits.length === 0) {
+      rewritten.push(originalBlock);
+      continue;
+    }
+
+    touched = true;
+    if (hits.some((hit) => hit.role === "anchor")) {
+      if (!replacedAnchor) {
+        rewritten.push({
+          type: "text",
+          text: formatSummaryContent(block, message.content),
+        });
+        replacedAnchor = true;
+      }
+      continue;
+    }
+
+    // Drop-only fragment from this block: omit it.
+  }
+
+  if (!touched || !replacedAnchor) {
+    return null;
+  }
+  return rewritten;
 }
 
 /**

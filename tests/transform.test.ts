@@ -299,10 +299,11 @@ test("combined attachment result plus prompt and assistant thinking still match 
 
   const result = applySubstitutions(request, jsonl, [block]);
   assert.equal(result.request.messages.length, 1);
-  assert.match(
-    result.request.messages[0]?.content as string,
-    /Collapsed @reference exchange\./,
-  );
+  assert.ok(Array.isArray(result.request.messages[0]?.content));
+  const content = result.request.messages[0]?.content as Array<Record<string, unknown>>;
+  assert.equal(content.length, 1);
+  assert.equal(content[0]?.["type"], "text");
+  assert.match(String(content[0]?.["text"]), /Collapsed @reference exchange\./);
   assert.equal(result.anchors_substituted, 1);
   assert.equal(result.messages_dropped, 2);
   assert.deepEqual(result.blocks_applied, [1]);
@@ -471,6 +472,83 @@ test("tool_use still matches when JSONL includes caller metadata but request omi
   assert.deepEqual(result.blocks_applied, [1]);
 });
 
+test("embedded tool_use anchor inside a larger assistant message is rewritten in place", () => {
+  const request = makeRequest([
+    {
+      role: "assistant",
+      content: [
+        { type: "thinking", thinking: "private reasoning", signature: "sig" },
+        { type: "text", text: "Section structure mapped." },
+        {
+          type: "tool_use",
+          id: "toolu_pdf",
+          name: "Bash",
+          input: { command: "pdftotext file.pdf -f 1 -l 12 -" },
+        },
+      ],
+    },
+    {
+      role: "user",
+      content: [
+        {
+          tool_use_id: "toolu_pdf",
+          type: "tool_result",
+          content: "PDF content",
+          is_error: false,
+        },
+      ],
+    },
+  ]);
+
+  const jsonl: JsonlMessage[] = [
+    {
+      uuid: "u1",
+      role: "assistant",
+      content: [
+        {
+          type: "tool_use",
+          id: "toolu_pdf",
+          name: "Bash",
+          input: { command: "pdftotext file.pdf -f 1 -l 12 -" },
+          caller: { type: "direct" },
+        },
+      ],
+    },
+    {
+      uuid: "u2",
+      role: "user",
+      content: [
+        {
+          tool_use_id: "toolu_pdf",
+          type: "tool_result",
+          content: "PDF content",
+          is_error: false,
+        },
+      ],
+    },
+  ];
+  const block = makeBlock({
+    anchor_uuid: "u1",
+    compressed_uuids: ["u1", "u2"],
+    summary: "Collapsed PDF read exchange.",
+  });
+
+  const result = applySubstitutions(request, jsonl, [block]);
+  assert.equal(result.request.messages.length, 1);
+  assert.equal(result.request.messages[0]?.role, "assistant");
+  assert.ok(Array.isArray(result.request.messages[0]?.content));
+  const content = result.request.messages[0]?.content as Array<Record<string, unknown>>;
+  assert.equal(content.length, 3);
+  assert.equal(content[0]?.["type"], "thinking");
+  assert.equal(content[1]?.["type"], "text");
+  assert.equal(content[1]?.["text"], "Section structure mapped.");
+  assert.equal(content[2]?.["type"], "text");
+  assert.match(String(content[2]?.["text"]), /Collapsed PDF read exchange\./);
+  assert.equal(result.anchors_substituted, 1);
+  assert.equal(result.messages_dropped, 1);
+  assert.deepEqual(result.blocks_applied, [1]);
+});
+
 test("multiple non-overlapping blocks: each applied independently", () => {
   const request = makeRequest([
     { role: "user", content: "a1" },
@@ -507,6 +585,40 @@ test("multiple non-overlapping blocks: each applied independently", () => {
   assert.deepEqual(result.blocks_applied, [1, 2]);
   assert.equal(result.anchors_substituted, 2);
   assert.equal(result.messages_dropped, 2);
+});
+
+test("block does not partially apply when only non-anchor tool_result is present", () => {
+  const toolResult = [
+    {
+      tool_use_id: "toolu_123",
+      type: "tool_result",
+      content: "tool output",
+      is_error: false,
+    },
+  ];
+  const request = makeRequest([{ role: "user", content: toolResult }]);
+  const jsonl: JsonlMessage[] = [
+    {
+      uuid: "u_tool",
+      role: "assistant",
+      content: [
+        { type: "tool_use", id: "toolu_123", name: "Bash", input: { cmd: "ls" } },
+      ],
+    },
+    { uuid: "u_result", role: "user", content: toolResult },
+  ];
+  const block = makeBlock({
+    anchor_uuid: "u_tool",
+    compressed_uuids: ["u_tool", "u_result"],
+    summary: "collapsed tool exchange",
+  });
+
+  const result = applySubstitutions(request, jsonl, [block]);
+  assert.deepEqual(result.request.messages, request.messages);
+  assert.equal(result.anchors_substituted, 0);
+  assert.equal(result.messages_dropped, 0);
+  assert.deepEqual(result.blocks_applied, []);
+  assert.deepEqual(result.blocks_inactive_in_request, [1]);
 });
 
 test("block whose UUIDs aren't in the request is reported as inactive_in_request", () => {
