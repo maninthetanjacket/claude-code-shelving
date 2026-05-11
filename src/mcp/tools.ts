@@ -5,6 +5,11 @@ import {
   setBlockActive,
   writeBlock,
 } from "../shared/registry.js";
+import {
+  deleteBookmark,
+  getBookmark,
+  setBookmark,
+} from "../shared/bookmarks.js";
 import { blockToMeta, type Block } from "../shared/types.js";
 import {
   requireNonEmptyString,
@@ -139,6 +144,73 @@ export const TOOLS: Tool[] = [
         },
       },
       required: [],
+    },
+  },
+  {
+    name: "start_arc",
+    description:
+      "Records a labeled bookmark at the current point in the session. The bookmark captures the UUID of the most recent JSONL entry at invocation time (typically the user message that triggered this assistant turn). Pair with compress_arc to later compress everything from this point through the most recent user message into a single summary, without having to enumerate UUIDs by hand.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        session_id: {
+          type: "string",
+          description:
+            "Claude Code session UUID. Optional: defaults to the CLAUDE_CODE_SESSION_ID environment variable.",
+        },
+        label: {
+          type: "string",
+          minLength: 1,
+          description:
+            "Label for this bookmark, unique within the session. Used later by compress_arc to identify the range. If a bookmark with this label already exists, it is replaced.",
+        },
+      },
+      required: ["label"],
+    },
+  },
+  {
+    name: "compress_arc",
+    description:
+      "Compresses the range of messages from a previously-set bookmark to the most recent user message in the session. The bookmark's anchor UUID becomes the start; the latest user message at this call becomes the end. The current assistant turn (containing any preceding reflection text and the compress_arc call itself) is naturally excluded, leaving the reflection visible in the conversation. Equivalent to looking up the UUIDs and calling compress directly, but mechanical. The bookmark is removed once the compression succeeds.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        session_id: {
+          type: "string",
+          description:
+            "Claude Code session UUID. Optional: defaults to the CLAUDE_CODE_SESSION_ID environment variable.",
+        },
+        label: {
+          type: "string",
+          minLength: 1,
+          description:
+            "Label of the bookmark set earlier via start_arc. Identifies which arc to compress.",
+        },
+        summary: {
+          type: "string",
+          minLength: 1,
+          description:
+            "Summary text that will replace the anchor message's content in subsequent API requests. Author this from a landed place — it is what the model receives in place of the original messages.",
+        },
+        focus: {
+          type: "string",
+          description:
+            "Optional metadata describing what the summary preserved. Stored in the registry for operator inspection; not used in substitution logic.",
+        },
+        original_tokens: {
+          type: "integer",
+          minimum: 0,
+          description:
+            "Approximate token count of the original messages being replaced. Stored as registry metadata.",
+        },
+        summary_tokens: {
+          type: "integer",
+          minimum: 0,
+          description:
+            "Approximate token count of the summary itself. Stored as registry metadata.",
+        },
+      },
+      required: ["label", "summary"],
     },
   },
 ];
@@ -387,6 +459,188 @@ export async function handleList(args: unknown): Promise<ToolResult> {
 }
 
 // ----------------------------------------------------------------------------
+// Bookmark handlers (start_arc / compress_arc)
+// ----------------------------------------------------------------------------
+
+export async function handleStartArc(args: unknown): Promise<ToolResult> {
+  if (typeof args !== "object" || args === null) {
+    return errorResult("arguments must be an object");
+  }
+  const a = args as Record<string, unknown>;
+
+  let sessionId: string;
+  let label: string;
+  try {
+    sessionId = resolveSessionIdArg(a["session_id"]);
+    label = requireNonEmptyString(a["label"], "label");
+  } catch (e) {
+    if (e instanceof ValidationError) return errorResult(e.message);
+    throw e;
+  }
+
+  // Find the most recent JSONL entry; its UUID is the bookmark anchor.
+  // At start_arc invocation time, the current assistant turn (containing
+  // start_arc itself) has not yet been written to JSONL, so the latest
+  // entry is the user message that triggered this turn.
+  const { path, messages } = await loadSessionMessages(sessionId);
+  if (path === null) {
+    return errorResult(`Session JSONL not found for session ${sessionId}`);
+  }
+  if (messages.length === 0) {
+    return errorResult(
+      `Session JSONL for ${sessionId} contains no messages to anchor at`,
+    );
+  }
+
+  const latest = messages[messages.length - 1];
+  if (latest === undefined) {
+    return errorResult("could not resolve the latest JSONL entry");
+  }
+
+  const bookmark = {
+    label,
+    anchor_uuid: latest.uuid,
+    created_at: new Date().toISOString(),
+  };
+  await setBookmark(sessionId, bookmark);
+
+  return successResult({
+    label: bookmark.label,
+    anchor_uuid: bookmark.anchor_uuid,
+    created_at: bookmark.created_at,
+  });
+}
+
+export async function handleCompressArc(args: unknown): Promise<ToolResult> {
+  if (typeof args !== "object" || args === null) {
+    return errorResult("arguments must be an object");
+  }
+  const a = args as Record<string, unknown>;
+
+  let sessionId: string;
+  let label: string;
+  let summary: string;
+  let focus: string | undefined;
+  let originalTokens: number | undefined;
+  let summaryTokens: number | undefined;
+  try {
+    sessionId = resolveSessionIdArg(a["session_id"]);
+    label = requireNonEmptyString(a["label"], "label");
+    summary = requireNonEmptyString(a["summary"], "summary");
+    focus = optionalString(a["focus"], "focus");
+    originalTokens = optionalNonNegativeInt(a["original_tokens"], "original_tokens");
+    summaryTokens = optionalNonNegativeInt(a["summary_tokens"], "summary_tokens");
+  } catch (e) {
+    if (e instanceof ValidationError) return errorResult(e.message);
+    throw e;
+  }
+
+  const bookmark = await getBookmark(sessionId, label);
+  if (bookmark === null) {
+    return errorResult(
+      `No bookmark labeled "${label}" found in session ${sessionId}. ` +
+        `Call start_arc first.`,
+    );
+  }
+
+  const { path, messages } = await loadSessionMessages(sessionId);
+  if (path === null) {
+    return errorResult(`Session JSONL not found for session ${sessionId}`);
+  }
+
+  // Find the bookmark's anchor in the JSONL.
+  const anchorIdx = messages.findIndex((m) => m.uuid === bookmark.anchor_uuid);
+  if (anchorIdx === -1) {
+    return errorResult(
+      `Bookmark "${label}" points at UUID ${bookmark.anchor_uuid}, ` +
+        `which was not found in the session JSONL.`,
+    );
+  }
+
+  // End of range: the most recent user message in the JSONL at this moment.
+  // This naturally excludes the current assistant turn (the one containing
+  // this compress_arc call and any preceding reflection text), since that
+  // turn has not yet been written to JSONL.
+  let endIdx = -1;
+  for (let i = messages.length - 1; i >= anchorIdx; i--) {
+    const msg = messages[i];
+    if (msg !== undefined && msg.role === "user") {
+      endIdx = i;
+      break;
+    }
+  }
+  if (endIdx === -1) {
+    return errorResult(
+      `Bookmark "${label}" has no user message after the anchor to close the range. ` +
+        `Run some work that produces tool_results before calling compress_arc.`,
+    );
+  }
+
+  // Collect the contiguous UUID range. Use the same collapse-consecutive
+  // semantics as the existing validation logic to handle any sidechain
+  // duplication in the JSONL.
+  const expandedUuidStream = collapseConsecutiveDuplicates(
+    messages.map((m) => m.uuid),
+  );
+  // Find anchor/end positions in the collapsed stream by their UUIDs.
+  const anchorPos = expandedUuidStream.indexOf(bookmark.anchor_uuid);
+  const endUuid = messages[endIdx]?.uuid;
+  if (endUuid === undefined) {
+    return errorResult("could not resolve end UUID for the bookmarked range");
+  }
+  // Find the LAST occurrence of endUuid in the collapsed stream to be safe.
+  let endPos = -1;
+  for (let i = expandedUuidStream.length - 1; i >= 0; i--) {
+    if (expandedUuidStream[i] === endUuid) {
+      endPos = i;
+      break;
+    }
+  }
+  if (anchorPos === -1 || endPos === -1 || anchorPos > endPos) {
+    return errorResult(
+      "could not assemble a contiguous range from bookmark anchor to latest user message",
+    );
+  }
+  const compressedUuids = expandedUuidStream.slice(anchorPos, endPos + 1);
+
+  // Build and persist the block (same shape as handleCompress).
+  const blockId = await nextBlockId(sessionId);
+  const anchorUuid = compressedUuids[0];
+  if (anchorUuid === undefined) {
+    return errorResult("bookmark range produced an empty UUID list");
+  }
+
+  const block: Block = {
+    block_id: blockId,
+    created_at: new Date().toISOString(),
+    active: true,
+    anchor_uuid: anchorUuid,
+    compressed_uuids: compressedUuids,
+    summary,
+    original_tokens: originalTokens ?? 0,
+    summary_tokens: summaryTokens ?? 0,
+    focus: focus ?? null,
+    parent_block_id: null,
+  };
+
+  await writeBlock(sessionId, block);
+
+  // Remove the bookmark — its purpose is fulfilled. A future start_arc
+  // with the same label is then unambiguous.
+  await deleteBookmark(sessionId, label);
+
+  return successResult({
+    block_id: blockId,
+    label,
+    anchor_uuid: anchorUuid,
+    compressed_count: compressedUuids.length,
+    original_tokens: block.original_tokens,
+    summary_tokens: block.summary_tokens,
+    active: true,
+  });
+}
+
+// ----------------------------------------------------------------------------
 // Dispatch
 // ----------------------------------------------------------------------------
 
@@ -403,6 +657,10 @@ export async function dispatch(
       return handleRecompress(args);
     case "list_compressions":
       return handleList(args);
+    case "start_arc":
+      return handleStartArc(args);
+    case "compress_arc":
+      return handleCompressArc(args);
     default:
       return errorResult(`Unknown tool: ${name}`);
   }

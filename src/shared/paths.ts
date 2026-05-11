@@ -34,3 +34,13 @@ export function blockPath(sessionId: SessionId, blockId: number): string {
 export function blockTempPath(sessionId: SessionId, blockId: number): string {
   return join(sessionDir(sessionId), `${blockId}.json.tmp`);
 }
+
+/** Path to the per-session bookmarks file. */
+export function bookmarksPath(sessionId: SessionId): string {
+  return join(sessionDir(sessionId), "bookmarks.json");
+}
+
+/** Temp filename used by atomic writes for the bookmarks file. */
+export function bookmarksTempPath(sessionId: SessionId): string {
+  return join(sessionDir(sessionId), "bookmarks.json.tmp");
+}

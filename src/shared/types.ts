@@ -94,3 +94,45 @@ export function blockToMeta(block: Block): BlockMeta {
 
 /** Claude Code session identifier (UUID). */
 export type SessionId = string;
+
+/**
+ * A bookmark records a labeled anchor UUID for later range-based compression.
+ *
+ * Workflow:
+ *   1. Model calls `start_arc(label)` — bookmark captures the UUID of the most
+ *      recent JSONL entry at invocation time (typically the user message that
+ *      triggered the current assistant turn).
+ *   2. Model does work (reads, edits, etc.) — JSONL grows.
+ *   3. Model calls `compress_arc(label, summary)` — registry resolves the range
+ *      from the bookmark UUID to the most recent user message at this call,
+ *      submits as a Block. The current assistant turn (with the compress_arc
+ *      call and any preceding reflection text) is naturally excluded because
+ *      it is not yet a user message.
+ *
+ * Bookmarks live alongside blocks in the per-session directory but in a single
+ * file (`bookmarks.json`) keyed by label. Labels are scoped per session.
+ */
+export interface Bookmark {
+  /** Model-chosen label for this bookmark. Unique within a session. */
+  label: string;
+
+  /**
+   * The JSONL message UUID this bookmark anchors at. Captured at start_arc
+   * time as the most recent JSONL entry, which is typically the user message
+   * that triggered the assistant turn containing the start_arc call.
+   */
+  anchor_uuid: string;
+
+  /** ISO-8601 timestamp of when this bookmark was created. */
+  created_at: string;
+}
+
+/**
+ * On-disk shape of the per-session bookmarks file.
+ * Wraps the bookmark map in an object with a version field for future
+ * schema evolution without breaking older readers.
+ */
+export interface BookmarkFile {
+  version: 1;
+  bookmarks: Record<string, Bookmark>;
+}

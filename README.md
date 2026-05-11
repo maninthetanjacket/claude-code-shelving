@@ -2,13 +2,13 @@
 
 Deliberate context-shelving for Claude Code. The model invokes a `compress` tool when work is settled enough to be summary-only; a proxy substitutes the registered summary for the original content on subsequent API requests; the session's source-of-truth JSONL stays untouched.
 
-**Status:** Stage 1 working end-to-end and validated against real CC sessions. 88 passing tests including E2E proxy + cache stability and regressions for harness-injected reminders, `tool_use` metadata drift, and tool_use anchors embedded in larger multi-block messages. The canonical design document lives at `field-guide/shared-space/shelving-design.md` during development.
+**Status:** Stage 1 working end-to-end and validated against real CC sessions. 106 passing tests including E2E proxy + cache stability and regressions for harness-injected reminders, `tool_use` metadata drift, and tool_use anchors embedded in larger multi-block messages. The canonical design document lives at `field-guide/shared-space/shelving-design.md` during development.
 
 ## Architecture
 
 Two coordinated components:
 
-- **MCP server** (`src/mcp/`) — exposes `compress` / `decompress` / `recompress` / `list_compressions` as model-callable tools. Reads from and writes to the registry.
+- **MCP server** (`src/mcp/`) — exposes `compress` / `decompress` / `recompress` / `list_compressions` / `start_arc` / `compress_arc` as model-callable tools. Reads from and writes to the registry.
 - **Proxy** (`src/proxy/`) — HTTP server between Claude Code and the Anthropic API. Reads the registry on each request and applies cache-stable substitutions.
 
 They communicate via a file-based registry under `~/.claude/shelving/<session-id>/`. They never talk to each other directly; both just read/write the same JSON files.
@@ -202,6 +202,32 @@ Reactivates a previously decompressed block. The summary text is byte-identical 
 
 Returns metadata for all blocks in the current session (active and inactive).
 
+### Bookmarking a range (alternative to enumerating UUIDs)
+
+For multi-step work where the eventual range isn't known in advance — e.g., reading a chunk of a document, doing exploratory tool calls before knowing what's relevant — bookmark the start, do the work, then compress the bookmarked range without having to look up UUIDs.
+
+**Start an arc** (records a bookmark at the current point):
+
+```json
+{ "label": "chunk-3" }
+```
+
+The bookmark captures the UUID of the most recent JSONL entry at invocation time (typically the user message that triggered this assistant turn).
+
+**Compress an arc** (resolves the bookmarked range and submits as a Block):
+
+```json
+{
+  "label": "chunk-3",
+  "summary": "What the model wants to preserve as the model's own voice.",
+  "focus": "Optional metadata"
+}
+```
+
+The range spans from the bookmark's anchor UUID to the most recent user message in the JSONL at this call. The current assistant turn (containing any preceding reflection text and the `compress_arc` call itself) is naturally excluded, leaving the reflection visible in the conversation. The bookmark is consumed once compression succeeds.
+
+This is equivalent to `compress` with the resolved UUIDs but doesn't require the model to enumerate them.
+
 ## Configuration reference
 
 Proxy:
@@ -266,7 +292,7 @@ curl http://127.0.0.1:9802/health
 
 # 2. Run tests
 cd claude-code-shelving && npm test
-# Expected: 86 passing
+# Expected: 106 passing
 
 # 3. From inside a CC session with the MCP server registered, ask the model
 #    to call list_compressions. It should return an empty blocks array.
@@ -276,6 +302,7 @@ cd claude-code-shelving && npm test
 
 What's implemented:
 - `compress`, `decompress`, `recompress`, `list_compressions` MCP tools
+- `start_arc` / `compress_arc` MCP tools for bookmark-based range capture (label a starting point, do work, compress the labeled range without enumerating UUIDs)
 - `find-arc` CLI for assistive boundary discovery (mechanical search; model decides)
 - Range-based compress (model provides explicit UUID list)
 - Model-authored summaries (no proxy-side summarization)

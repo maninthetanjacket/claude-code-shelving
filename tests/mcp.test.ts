@@ -9,10 +9,13 @@ import {
   handleDecompress,
   handleRecompress,
   handleList,
+  handleStartArc,
+  handleCompressArc,
   dispatch,
 } from "../src/mcp/tools.ts";
 import { sessionDir } from "../src/shared/paths.ts";
 import { readBlock } from "../src/shared/registry.ts";
+import { getBookmark } from "../src/shared/bookmarks.ts";
 
 let tempRoot: string;
 const TEST_SESSION = "test-mcp-session";
@@ -488,4 +491,150 @@ test("dispatch rejects non-object arguments", async () => {
   const result = await dispatch("compress", "not an object");
   assert.equal(result.isError, true);
   assert.match(getText(result), /must be an object/);
+});
+
+// ----------------------------------------------------------------------------
+// start_arc / compress_arc
+// ----------------------------------------------------------------------------
+
+test("start_arc captures the most recent JSONL entry as anchor", async () => {
+  await writeSimpleSessionJsonl(TEST_SESSION, ["u1", "a1", "u2", "a2", "u3"]);
+  const result = await handleStartArc({
+    session_id: TEST_SESSION,
+    label: "chunk-1",
+  });
+  assert.equal(result.isError, undefined);
+  const payload = parseResult(result) as Record<string, unknown>;
+  assert.equal(payload["label"], "chunk-1");
+  assert.equal(payload["anchor_uuid"], "u3");
+
+  const stored = await getBookmark(TEST_SESSION, "chunk-1");
+  assert.equal(stored?.anchor_uuid, "u3");
+});
+
+test("start_arc requires a non-empty label", async () => {
+  await writeSimpleSessionJsonl(TEST_SESSION, ["u1"]);
+  const result = await handleStartArc({
+    session_id: TEST_SESSION,
+    label: "",
+  });
+  assert.equal(result.isError, true);
+});
+
+test("start_arc errors when the session JSONL is missing", async () => {
+  const result = await handleStartArc({
+    session_id: "nonexistent-session",
+    label: "chunk-1",
+  });
+  assert.equal(result.isError, true);
+  assert.match(getText(result), /not found/i);
+});
+
+test("compress_arc errors when the bookmark does not exist", async () => {
+  await writeSimpleSessionJsonl(TEST_SESSION, ["u1", "a1"]);
+  const result = await handleCompressArc({
+    session_id: TEST_SESSION,
+    label: "missing",
+    summary: "s",
+  });
+  assert.equal(result.isError, true);
+  assert.match(getText(result), /No bookmark/);
+});
+
+test("compress_arc captures the range from bookmark to last user message", async () => {
+  // Initial state: one user message that the bookmark will anchor on.
+  await writeSimpleSessionJsonl(TEST_SESSION, ["u1"]);
+
+  // Bookmark anchors at u1 (the only / latest entry).
+  const startResult = await handleStartArc({
+    session_id: TEST_SESSION,
+    label: "chunk-1",
+  });
+  assert.equal(startResult.isError, undefined);
+
+  // Simulate the assistant doing work: more messages arrive in the JSONL.
+  // u1, a1, u2 (tool_result), a2 (tool_use), u3 (tool_result).
+  // We rewrite the file to extend the sequence.
+  await writeSimpleSessionJsonl(TEST_SESSION, ["u1", "a1", "u2", "a2", "u3"]);
+
+  const result = await handleCompressArc({
+    session_id: TEST_SESSION,
+    label: "chunk-1",
+    summary: "what happened in chunk 1",
+    focus: "test arc",
+  });
+  assert.equal(result.isError, undefined);
+  const payload = parseResult(result) as Record<string, unknown>;
+  assert.equal(payload["label"], "chunk-1");
+  assert.equal(payload["anchor_uuid"], "u1");
+  // Range is u1..u3 inclusive → 5 UUIDs.
+  assert.equal(payload["compressed_count"], 5);
+
+  // Verify the block landed in the registry with the right shape.
+  const block = await readBlock(TEST_SESSION, payload["block_id"] as number);
+  assert.notEqual(block, null);
+  assert.deepEqual(block?.compressed_uuids, ["u1", "a1", "u2", "a2", "u3"]);
+  assert.equal(block?.summary, "what happened in chunk 1");
+  assert.equal(block?.focus, "test arc");
+
+  // The bookmark should be consumed after a successful compress_arc.
+  const consumed = await getBookmark(TEST_SESSION, "chunk-1");
+  assert.equal(consumed, null);
+});
+
+test("compress_arc errors if no user message exists at or after the bookmark", async () => {
+  // Anchor at an assistant message, and have no subsequent user messages.
+  // (Pathological case — start_arc usually points at user messages, but this
+  // verifies the explicit error rather than a silent empty-range block.)
+  await writeSimpleSessionJsonl(TEST_SESSION, ["u1", "a1"]);
+  // Manually inject a bookmark anchored at the assistant message.
+  const { setBookmark } = await import("../src/shared/bookmarks.ts");
+  await setBookmark(TEST_SESSION, {
+    label: "bad-anchor",
+    anchor_uuid: "a1",
+    created_at: new Date().toISOString(),
+  });
+  // No new user messages appear; the only user message u1 is BEFORE a1.
+  const result = await handleCompressArc({
+    session_id: TEST_SESSION,
+    label: "bad-anchor",
+    summary: "s",
+  });
+  assert.equal(result.isError, true);
+  assert.match(getText(result), /no user message/i);
+});
+
+test("compress_arc errors when the bookmark anchor UUID is not in the JSONL", async () => {
+  await writeSimpleSessionJsonl(TEST_SESSION, ["u1", "a1", "u2"]);
+  const { setBookmark } = await import("../src/shared/bookmarks.ts");
+  await setBookmark(TEST_SESSION, {
+    label: "ghost",
+    anchor_uuid: "missing-uuid",
+    created_at: new Date().toISOString(),
+  });
+  const result = await handleCompressArc({
+    session_id: TEST_SESSION,
+    label: "ghost",
+    summary: "s",
+  });
+  assert.equal(result.isError, true);
+  assert.match(getText(result), /not found/i);
+});
+
+test("dispatch routes start_arc and compress_arc correctly", async () => {
+  await writeSimpleSessionJsonl(TEST_SESSION, ["u1"]);
+  const startResult = await dispatch("start_arc", {
+    session_id: TEST_SESSION,
+    label: "via-dispatch",
+  });
+  assert.equal(startResult.isError, undefined);
+  await writeSimpleSessionJsonl(TEST_SESSION, ["u1", "a1", "u2"]);
+  const compressResult = await dispatch("compress_arc", {
+    session_id: TEST_SESSION,
+    label: "via-dispatch",
+    summary: "dispatched summary",
+  });
+  assert.equal(compressResult.isError, undefined);
+  const payload = parseResult(compressResult) as Record<string, unknown>;
+  assert.equal(payload["label"], "via-dispatch");
 });
