@@ -10,17 +10,27 @@ import type { Block } from "../shared/types.js";
  * Output: a modified request body where each compressed range has been
  * collapsed to its summary at the anchor position.
  *
- * Matching strategy: content-based, at two granularities.
+ * Matching strategy: layered, with progressively more forgiving identity.
  *
- * Whole-message: each request message is normalized and compared against the
- * UUID→content map. If a whole message matches, we know its UUID and can
- * check membership in active blocks.
+ * 1. Whole-message content match. Each request message is normalized and
+ *    compared against the UUID→content map. If a whole message matches, we
+ *    know its UUID and can check membership in active blocks.
  *
- * Fragment-level: when whole-message matching fails (because CC has combined
- * multiple JSONL entries into one API message — e.g., thinking + text +
- * tool_use), each content block is matched individually via
- * `fragmentKeyForBlock`. This recovers the UUIDs of constituent fragments
- * even when their containing message has no exact equivalent in JSONL.
+ * 2. Fragment-level content match. When whole-message matching fails
+ *    (because CC has combined multiple JSONL entries into one API message —
+ *    e.g., thinking + text + tool_use), each content block is matched
+ *    individually via `fragmentKeyForBlock`. This recovers the UUIDs of
+ *    constituent fragments even when their containing message has no exact
+ *    equivalent in JSONL.
+ *
+ * 3. Tool-pair ID match as backstop. When content matching fails entirely —
+ *    e.g., a tool_use's input bytes drift between JSONL and the API request,
+ *    or a tool_result's content carries new harness annotations we haven't
+ *    seen before — we fall back to matching by tool_use.id (for assistant
+ *    tool_use blocks) and tool_result.tool_use_id (for user tool_result
+ *    blocks). These IDs are stable across the JSONL/request boundary and
+ *    keep the two sides of a tool exchange in the same block, preventing the
+ *    asymmetric-drop / orphaned-tool_use failure mode.
  *
  * Anchor-seen filter: before substituting, we verify that the block's anchor
  * UUID was matched somewhere in this request. Without this, a request that
@@ -123,6 +133,8 @@ export function applySubstitutions(
   // If two UUIDs share a content-key, last one wins (rare; documented).
   const keyToUuid = new Map<string, string>();
   const fragmentKeyToUuids = new Map<string, string[]>();
+  const toolUseIdToUuids = new Map<string, string[]>();
+  const toolResultIdToUuids = new Map<string, string[]>();
   for (const m of jsonlMessages) {
     keyToUuid.set(contentKey(m.role, m.content), m.uuid);
     for (const fragmentKey of fragmentKeys(m.role, m.content)) {
@@ -133,6 +145,7 @@ export function applySubstitutions(
         existing.push(m.uuid);
       }
     }
+    indexToolPairIds(m, toolUseIdToUuids, toolResultIdToUuids);
   }
 
   // Build uuid → block lookup for each active block, plus uuid → role-in-block.
@@ -155,7 +168,13 @@ export function applySubstitutions(
   let messagesDropped = 0;
 
   const resolvedPerMessage = request.messages.map((apiMsg) =>
-    resolveMessageMatch(apiMsg, keyToUuid, fragmentKeyToUuids),
+    resolveMessageMatch(
+      apiMsg,
+      keyToUuid,
+      fragmentKeyToUuids,
+      toolUseIdToUuids,
+      toolResultIdToUuids,
+    ),
   );
 
   for (const resolved of resolvedPerMessage) {
@@ -285,6 +304,8 @@ function resolveMessageMatch(
   message: ApiMessage,
   keyToUuid: Map<string, string>,
   fragmentKeyToUuids: Map<string, string[]>,
+  toolUseIdToUuids: Map<string, string[]>,
+  toolResultIdToUuids: Map<string, string[]>,
 ): ResolvedMessageMatch {
   const exact = keyToUuid.get(contentKey(message.role, message.content));
   if (exact !== undefined) {
@@ -303,6 +324,17 @@ function resolveMessageMatch(
 
   const matched = new Set<string>();
   const fragmentMatches = message.content.map((block) => {
+    const directToolUuids = directToolPairUuidsForBlock(
+      message.role,
+      block,
+      toolUseIdToUuids,
+      toolResultIdToUuids,
+    );
+    if (directToolUuids.length > 0) {
+      for (const uuid of directToolUuids) matched.add(uuid);
+      return directToolUuids;
+    }
+
     const key = fragmentKeyForBlock(message.role, block);
     if (key === null) return [];
     const uuids = fragmentKeyToUuids.get(key) ?? [];
@@ -314,6 +346,21 @@ function resolveMessageMatch(
     exactUuid: null,
     fragmentMatches,
   };
+}
+
+function directToolPairUuidsForBlock(
+  role: "user" | "assistant",
+  block: unknown,
+  toolUseIdToUuids: Map<string, string[]>,
+  toolResultIdToUuids: Map<string, string[]>,
+): string[] {
+  if (role === "assistant") {
+    const toolUseId = getToolUseId(block);
+    return toolUseId === null ? [] : (toolUseIdToUuids.get(toolUseId) ?? []);
+  }
+
+  const toolResultId = getToolResultToolUseId(block);
+  return toolResultId === null ? [] : (toolResultIdToUuids.get(toolResultId) ?? []);
 }
 
 function fragmentKeyForBlock(role: string, block: unknown): string | null {
@@ -331,6 +378,22 @@ function fragmentKeyForBlock(role: string, block: unknown): string | null {
     return `${role}:f:${JSON.stringify(normalizeToolResultBlock(record))}`;
   }
   return null;
+}
+
+function getToolUseId(block: unknown): string | null {
+  if (typeof block !== "object" || block === null) return null;
+  const record = block as Record<string, unknown>;
+  return record["type"] === "tool_use" && typeof record["id"] === "string"
+    ? record["id"]
+    : null;
+}
+
+function getToolResultToolUseId(block: unknown): string | null {
+  if (typeof block !== "object" || block === null) return null;
+  const record = block as Record<string, unknown>;
+  return record["type"] === "tool_result" && typeof record["tool_use_id"] === "string"
+    ? record["tool_use_id"]
+    : null;
 }
 
 function rewriteEmbeddedAnchorContent(
@@ -478,6 +541,35 @@ function normalizeContent(content: string | unknown[]): string | unknown[] {
     normalized.push(block);
   }
   return normalized;
+}
+
+function indexToolPairIds(
+  message: JsonlMessage,
+  toolUseIdToUuids: Map<string, string[]>,
+  toolResultIdToUuids: Map<string, string[]>,
+): void {
+  if (!Array.isArray(message.content)) return;
+  for (const block of message.content) {
+    const toolUseId = getToolUseId(block);
+    if (toolUseId !== null) {
+      pushUnique(toolUseIdToUuids, toolUseId, message.uuid);
+    }
+    const toolResultId = getToolResultToolUseId(block);
+    if (toolResultId !== null) {
+      pushUnique(toolResultIdToUuids, toolResultId, message.uuid);
+    }
+  }
+}
+
+function pushUnique(map: Map<string, string[]>, key: string, value: string): void {
+  const existing = map.get(key);
+  if (existing === undefined) {
+    map.set(key, [value]);
+    return;
+  }
+  if (!existing.includes(value)) {
+    existing.push(value);
+  }
 }
 
 function trimSingleTrailingNewline(text: string): string {

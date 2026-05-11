@@ -2,7 +2,7 @@
 
 Deliberate context-shelving for Claude Code. The model invokes a `compress` tool when work is settled enough to be summary-only; a proxy substitutes the registered summary for the original content on subsequent API requests; the session's source-of-truth JSONL stays untouched.
 
-**Status:** Stage 1 working end-to-end and validated against real CC sessions. 106 passing tests including E2E proxy + cache stability and regressions for harness-injected reminders, `tool_use` metadata drift, and tool_use anchors embedded in larger multi-block messages. The canonical design document lives at `field-guide/shared-space/shelving-design.md` during development.
+**Status:** Stage 1 working end-to-end and validated against real CC sessions. 108 passing tests including E2E proxy + cache stability and regressions for harness-injected reminders, `tool_use` metadata drift, tool_use anchors embedded in larger multi-block messages, and tool-pair ID matching as a backstop when content bytes drift. The canonical design document lives at `field-guide/shared-space/shelving-design.md` during development.
 
 ## Architecture
 
@@ -292,7 +292,7 @@ curl http://127.0.0.1:9802/health
 
 # 2. Run tests
 cd claude-code-shelving && npm test
-# Expected: 106 passing
+# Expected: 108 passing
 
 # 3. From inside a CC session with the MCP server registered, ask the model
 #    to call list_compressions. It should return an empty blocks array.
@@ -309,6 +309,7 @@ What's implemented:
 - Cache-stable proxy substitution
 - Content-normalized matching: tolerates JSONL/API drift (thinking blocks, trailing newlines, harness-injected `<system-reminder>` on `tool_result`, `caller` metadata on `tool_use`). See `src/proxy/transform.ts` for the canonicalization invariant.
 - Fragment-level anchor matching: when an anchor `tool_use` lives inside a larger assistant message (with thinking and text alongside), substitution happens in place — surrounding content is preserved.
+- Tool-pair ID matching as backstop: when content matching fails entirely (drift beyond normalization), `tool_use.id` and `tool_result.tool_use_id` are used to keep both sides of a tool exchange in the same block — prevents orphaned-tool_use errors from asymmetric drops.
 - File-based registry under `~/.claude/shelving/<session>/`
 - Atomic registry writes; mtime-cached reads in the proxy
 - Fail-safe to passthrough on any transform error

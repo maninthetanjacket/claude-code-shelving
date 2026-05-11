@@ -393,6 +393,88 @@ test("tool_result with trailing injected system reminder still matches its JSONL
   assert.deepEqual(result.blocks_applied, [1]);
 });
 
+test("tool_result still matches when request drops trailing control chars before an injected reminder", () => {
+  const request = makeRequest([
+    {
+      role: "assistant",
+      content: [
+        {
+          type: "tool_use",
+          id: "toolu_pdf",
+          name: "Read",
+          input: { file_path: "/tmp/chunk.txt" },
+        },
+      ],
+    },
+    {
+      role: "user",
+      content: [
+        {
+          tool_use_id: "toolu_pdf",
+          type: "tool_result",
+          content:
+            "1\tLine one\n2\tLine two\n3\t24\n\n" +
+            "<system-reminder>\n" +
+            "The task tools haven't been used recently.\n\n" +
+            "</system-reminder>",
+          is_error: false,
+        },
+      ],
+    },
+    {
+      role: "assistant",
+      content: [{ type: "text", text: "Chunk 2 shelved." }],
+    },
+  ]);
+
+  const jsonl: JsonlMessage[] = [
+    {
+      uuid: "u1",
+      role: "assistant",
+      content: [
+        {
+          type: "tool_use",
+          id: "toolu_pdf",
+          name: "Read",
+          input: { file_path: "/tmp/chunk.txt" },
+        },
+      ],
+    },
+    {
+      uuid: "u2",
+      role: "user",
+      content: [
+        {
+          tool_use_id: "toolu_pdf",
+          type: "tool_result",
+          content: "1\tLine one\n2\tLine two\n3\t24\t\f",
+          is_error: false,
+        },
+      ],
+    },
+    {
+      uuid: "u3",
+      role: "assistant",
+      content: [{ type: "text", text: "Chunk 2 shelved." }],
+    },
+  ];
+  const block = makeBlock({
+    anchor_uuid: "u1",
+    compressed_uuids: ["u1", "u2", "u3"],
+    summary: "Collapsed PDF read exchange.",
+  });
+
+  const result = applySubstitutions(request, jsonl, [block]);
+  assert.equal(result.request.messages.length, 1);
+  assert.match(
+    result.request.messages[0]?.content as string,
+    /Collapsed PDF read exchange\./,
+  );
+  assert.equal(result.anchors_substituted, 1);
+  assert.equal(result.messages_dropped, 2);
+  assert.deepEqual(result.blocks_applied, [1]);
+});
+
 test("tool_use still matches when JSONL includes caller metadata but request omits it", () => {
   const request = makeRequest([
     {
@@ -467,6 +549,90 @@ test("tool_use still matches when JSONL includes caller metadata but request omi
     result.request.messages[0]?.content as string,
     /Collapsed tool-use exchange\./,
   );
+  assert.equal(result.anchors_substituted, 1);
+  assert.equal(result.messages_dropped, 2);
+  assert.deepEqual(result.blocks_applied, [1]);
+});
+
+test("tool_use_id pairing pulls both sides of a tool exchange into the same block", () => {
+  const request = makeRequest([
+    {
+      role: "assistant",
+      content: [
+        {
+          type: "tool_use",
+          id: "toolu_pair",
+          name: "Read",
+          input: { file_path: "/tmp/live-output.txt" },
+        },
+      ],
+    },
+    {
+      role: "user",
+      content: [
+        {
+          tool_use_id: "toolu_pair",
+          type: "tool_result",
+          content:
+            "live output with drift\n\n" +
+            "<system-reminder>\n" +
+            "A harness reminder was appended here.\n" +
+            "</system-reminder>",
+          is_error: false,
+        },
+      ],
+    },
+    {
+      role: "assistant",
+      content: [{ type: "text", text: "I read the live file." }],
+    },
+  ]);
+
+  const jsonl: JsonlMessage[] = [
+    {
+      uuid: "u1",
+      role: "assistant",
+      content: [
+        {
+          type: "tool_use",
+          id: "toolu_pair",
+          name: "Read",
+          input: { file_path: "/tmp/jsonl-output.txt" },
+          caller: { type: "direct" },
+        },
+      ],
+    },
+    {
+      uuid: "u2",
+      role: "user",
+      content: [
+        {
+          tool_use_id: "toolu_pair",
+          type: "tool_result",
+          content: "jsonl output from disk",
+          is_error: false,
+        },
+      ],
+    },
+    {
+      uuid: "u3",
+      role: "assistant",
+      content: [{ type: "text", text: "I read the live file." }],
+    },
+  ];
+  const block = makeBlock({
+    anchor_uuid: "u1",
+    compressed_uuids: ["u1", "u2", "u3"],
+    summary: "Collapsed paired tool exchange.",
+  });
+
+  const result = applySubstitutions(request, jsonl, [block]);
+  assert.equal(result.request.messages.length, 1);
+  assert.ok(Array.isArray(result.request.messages[0]?.content));
+  const content = result.request.messages[0]?.content as Array<Record<string, unknown>>;
+  assert.equal(content.length, 1);
+  assert.equal(content[0]?.["type"], "text");
+  assert.match(String(content[0]?.["text"]), /Collapsed paired tool exchange\./);
   assert.equal(result.anchors_substituted, 1);
   assert.equal(result.messages_dropped, 2);
   assert.deepEqual(result.blocks_applied, [1]);
