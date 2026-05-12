@@ -1,6 +1,6 @@
 import { test, before, after, beforeEach } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, rm, mkdir, writeFile } from "node:fs/promises";
+import { mkdtemp, rm, mkdir, writeFile, utimes } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -16,9 +16,11 @@ import {
 import { sessionDir } from "../src/shared/paths.ts";
 import { readBlock } from "../src/shared/registry.ts";
 import { getBookmark } from "../src/shared/bookmarks.ts";
+import { projectSlugForDir } from "../src/proxy/jsonl.ts";
 
 let tempRoot: string;
 const TEST_SESSION = "test-mcp-session";
+const TEST_PROJECT_DIR = "/tmp/test-project";
 
 before(async () => {
   tempRoot = await mkdtemp(join(tmpdir(), "shelving-mcp-test-"));
@@ -39,6 +41,15 @@ beforeEach(async () => {
     recursive: true,
     force: true,
   });
+  await rm(
+    join(process.env["CLAUDE_PROJECTS_DIR"]!, projectSlugForDir(TEST_PROJECT_DIR)),
+    {
+      recursive: true,
+      force: true,
+    },
+  );
+  delete process.env["CLAUDE_PROJECT_DIR"];
+  delete process.env["CLAUDE_CODE_SESSION_ID"];
 });
 
 function parseResult(result: { content: Array<{ type: string; text: string }> }): unknown {
@@ -80,6 +91,31 @@ async function writeRawSessionJsonl(sessionId: string, lines: unknown[]): Promis
     join(projDir, `${sessionId}.jsonl`),
     lines.map((line) => JSON.stringify(line)).join("\n") + "\n",
   );
+}
+
+async function writeSessionJsonlForProjectDir(
+  projectDir: string,
+  sessionId: string,
+  uuids: string[],
+  mtimeMs: number,
+): Promise<void> {
+  const projDir = join(process.env["CLAUDE_PROJECTS_DIR"]!, projectSlugForDir(projectDir));
+  await mkdir(projDir, { recursive: true });
+  const path = join(projDir, `${sessionId}.jsonl`);
+  const lines = uuids.map((uuid, idx) =>
+    JSON.stringify({
+      type: idx % 2 === 0 ? "user" : "assistant",
+      uuid,
+      message: {
+        role: idx % 2 === 0 ? "user" : "assistant",
+        content: `content-${uuid}`,
+      },
+      sessionId,
+    }),
+  );
+  await writeFile(path, lines.join("\n") + "\n");
+  const when = new Date(mtimeMs);
+  await utimes(path, when, when);
 }
 
 // ---------------------------------------------------------------------------
@@ -136,7 +172,7 @@ test("compress assigns monotonic block_ids", async () => {
   assert.equal(r2["block_id"], 2);
 });
 
-test("compress defaults token counts to 0 when omitted", async () => {
+test("compress estimates original_tokens and defaults summary_tokens to 0 when omitted", async () => {
   await writeSimpleSessionJsonl(TEST_SESSION, ["msg_a"]);
   await handleCompress({
     session_id: TEST_SESSION,
@@ -144,7 +180,7 @@ test("compress defaults token counts to 0 when omitted", async () => {
     summary: "s",
   });
   const block = await readBlock(TEST_SESSION, 1);
-  assert.equal(block?.original_tokens, 0);
+  assert.equal(block?.original_tokens, Math.ceil("content-msg_a".length / 4));
   assert.equal(block?.summary_tokens, 0);
   assert.equal(block?.focus, null);
 });
@@ -204,6 +240,126 @@ test("compress rejects empty last_phrase", async () => {
   assert.match(getText(result), /last_phrase/);
 });
 
+test("compress preview includes turn numbers and short boundary snippets", async () => {
+  await writeRawSessionJsonl(TEST_SESSION, [
+    {
+      type: "user",
+      uuid: "u1",
+      message: {
+        role: "user",
+        content: "start boundary message with enough text to make the preview obvious",
+      },
+    },
+    {
+      type: "assistant",
+      uuid: "a1",
+      message: {
+        role: "assistant",
+        content: "middle assistant message",
+      },
+    },
+    {
+      type: "user",
+      uuid: "u2",
+      message: {
+        role: "user",
+        content: "ending boundary message for preview validation",
+      },
+    },
+  ]);
+
+  const result = await handleCompress({
+    session_id: TEST_SESSION,
+    first_phrase: "start boundary",
+    last_phrase: "ending boundary",
+    preview_only: true,
+  });
+
+  assert.equal(result.isError, undefined);
+  const payload = parseResult(result) as Record<string, unknown>;
+  assert.equal(payload["preview"], true);
+  assert.equal(payload["start_turn"], 1);
+  assert.equal(payload["end_turn"], 3);
+  assert.match(String(payload["anchor_snippet"]), /start boundary message/);
+  assert.match(String(payload["end_snippet"]), /ending boundary message/);
+});
+
+test("compress turn preview returns preview payload and does not create a block", async () => {
+  await writeSimpleSessionJsonl(TEST_SESSION, ["u1", "a1", "u2", "a2", "u3"]);
+
+  const result = await handleCompress({
+    session_id: TEST_SESSION,
+    start_turn: 2,
+    end_turn: 4,
+    preview_only: true,
+    summary: "placeholder summary",
+  });
+
+  assert.equal(result.isError, undefined);
+  const payload = parseResult(result) as Record<string, unknown>;
+  assert.equal(payload["preview"], true);
+  assert.equal(payload["start_turn"], 2);
+  assert.equal(payload["end_turn"], 4);
+  assert.match(String(payload["anchor_snippet"]), /content-a1/);
+  assert.match(String(payload["end_snippet"]), /content-a2/);
+  assert.deepEqual(payload["range_uuids"], ["a1", "u2", "a2"]);
+
+  const block = await readBlock(TEST_SESSION, 1);
+  assert.equal(block, null);
+});
+
+test("compress estimation includes thinking, tool_use, and tool_result content", async () => {
+  const toolInput = { file_path: "/tmp/example.txt" };
+  await writeRawSessionJsonl(TEST_SESSION, [
+    {
+      type: "user",
+      uuid: "u1",
+      message: {
+        role: "user",
+        content: "hello",
+      },
+    },
+    {
+      type: "assistant",
+      uuid: "a1",
+      message: {
+        role: "assistant",
+        content: [
+          { type: "thinking", thinking: "brainstorm" },
+          { type: "tool_use", name: "Read", input: toolInput },
+        ],
+      },
+    },
+    {
+      type: "user",
+      uuid: "u2",
+      message: {
+        role: "user",
+        content: [
+          {
+            type: "tool_result",
+            content: [{ type: "text", text: "file contents" }],
+          },
+        ],
+      },
+    },
+  ]);
+
+  const result = await handleCompress({
+    session_id: TEST_SESSION,
+    compressed_uuids: ["u1", "a1", "u2"],
+    summary: "s",
+  });
+
+  assert.equal(result.isError, undefined);
+  const payload = parseResult(result) as Record<string, unknown>;
+  const expectedChars =
+    "hello".length +
+    ["brainstorm", `Read\n${JSON.stringify(toolInput)}`].join("\n").length +
+    "file contents".length;
+  assert.equal(payload["original_tokens"], Math.ceil(expectedChars / 4));
+});
+
 test("compress falls back to CLAUDE_CODE_SESSION_ID env var when session_id omitted", async () => {
   const prev = process.env["CLAUDE_CODE_SESSION_ID"];
   process.env["CLAUDE_CODE_SESSION_ID"] = TEST_SESSION;
@@ -222,19 +378,40 @@ test("compress falls back to CLAUDE_CODE_SESSION_ID env var when session_id omit
   }
 });
 
+test("compress falls back to the newest session transcript for CLAUDE_PROJECT_DIR", async () => {
+  process.env["CLAUDE_PROJECT_DIR"] = TEST_PROJECT_DIR;
+  const olderSession = "older-session";
+  const newerSession = "newer-session";
+
+  await writeSessionJsonlForProjectDir(TEST_PROJECT_DIR, olderSession, ["old_a"], 1_700_000_000_000);
+  await writeSessionJsonlForProjectDir(
+    TEST_PROJECT_DIR,
+    newerSession,
+    ["new_a"],
+    1_700_000_000_100,
+  );
+
+  const result = await handleCompress({
+    compressed_uuids: ["new_a"],
+    summary: "s",
+  });
+
+  assert.equal(result.isError, undefined);
+  const payload = parseResult(result) as Record<string, unknown>;
+  assert.equal(payload["block_id"], 1);
+
+  const block = await readBlock(newerSession, 1);
+  assert.notEqual(block, null);
+  assert.equal(block?.anchor_uuid, "new_a");
+});
+
 test("compress errors when session_id arg missing AND env var unset", async () => {
-  const prev = process.env["CLAUDE_CODE_SESSION_ID"];
-  delete process.env["CLAUDE_CODE_SESSION_ID"];
-  try {
-    const result = await handleCompress({
-      compressed_uuids: ["msg_a"],
-      summary: "s",
-    });
-    assert.equal(result.isError, true);
-    assert.match(getText(result), /session_id/);
-  } finally {
-    if (prev !== undefined) process.env["CLAUDE_CODE_SESSION_ID"] = prev;
-  }
+  const result = await handleCompress({
+    compressed_uuids: ["msg_a"],
+    summary: "s",
+  });
+  assert.equal(result.isError, true);
+  assert.match(getText(result), /session_id/);
 });
 
 test("compress rejects non-string uuids in array", async () => {
@@ -592,6 +769,7 @@ test("compress_arc captures the range from bookmark to last user message", async
   assert.equal(payload["anchor_uuid"], "u1");
   // Range is u1..u3 inclusive → 5 UUIDs.
   assert.equal(payload["compressed_count"], 5);
+  assert.ok((payload["original_tokens"] as number) > 0);
 
   // Verify the block landed in the registry with the right shape.
   const block = await readBlock(TEST_SESSION, payload["block_id"] as number);
@@ -599,6 +777,7 @@ test("compress_arc captures the range from bookmark to last user message", async
   assert.deepEqual(block?.compressed_uuids, ["u1", "a1", "u2", "a2", "u3"]);
   assert.equal(block?.summary, "what happened in chunk 1");
   assert.equal(block?.focus, "test arc");
+  assert.ok((block?.original_tokens ?? 0) > 0);
 
   // The bookmark should be consumed after a successful compress_arc.
   const consumed = await getBookmark(TEST_SESSION, "chunk-1");

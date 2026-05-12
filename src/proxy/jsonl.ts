@@ -1,7 +1,7 @@
 import { readFile, readdir, stat } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { basename, join, resolve } from "node:path";
 import type { JsonlMessage } from "./transform.js";
 
 /**
@@ -27,6 +27,18 @@ function projectsRoot(): string {
 }
 
 /**
+ * Claude Code stores project transcripts in a directory whose name is the
+ * absolute project path with path separators replaced by "-".
+ */
+export function projectSlugForDir(projectDir: string): string {
+  return resolve(projectDir).replaceAll("\\", "/").replaceAll("/", "-");
+}
+
+export function projectSessionsDir(projectDir: string): string {
+  return join(projectsRoot(), projectSlugForDir(projectDir));
+}
+
+/**
  * Find the session JSONL file for a given session id.
  * Returns null if not found.
  */
@@ -47,6 +59,45 @@ export async function findSessionJsonl(sessionId: string): Promise<string | null
     if (existsSync(candidate)) return candidate;
   }
   return null;
+}
+
+export async function findLatestSessionJsonlForProjectDir(
+  projectDir: string,
+): Promise<{ sessionId: string; path: string; mtime: number } | null> {
+  const sessionsDir = projectSessionsDir(projectDir);
+  if (!existsSync(sessionsDir)) return null;
+
+  let names: string[];
+  try {
+    names = await readdir(sessionsDir);
+  } catch {
+    return null;
+  }
+
+  const candidates = await Promise.all(
+    names
+      .filter((name) => name.endsWith(".jsonl"))
+      .map(async (name) => {
+        const path = join(sessionsDir, name);
+        try {
+          const s = await stat(path);
+          if (!s.isFile()) return null;
+          return {
+            sessionId: basename(name, ".jsonl"),
+            path,
+            mtime: s.mtimeMs,
+          };
+        } catch {
+          return null;
+        }
+      }),
+  );
+
+  const latest = candidates
+    .filter((candidate): candidate is { sessionId: string; path: string; mtime: number } => candidate !== null)
+    .sort((a, b) => b.mtime - a.mtime)[0];
+
+  return latest ?? null;
 }
 
 /**

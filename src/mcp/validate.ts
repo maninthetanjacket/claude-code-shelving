@@ -1,3 +1,5 @@
+import { findLatestSessionJsonlForProjectDir } from "../proxy/jsonl.js";
+
 /**
  * Lightweight runtime validation for MCP tool inputs.
  *
@@ -90,14 +92,22 @@ export function optionalNonEmptyString(
 
 /**
  * Resolve session_id from explicit argument, falling back to the
- * CLAUDE_CODE_SESSION_ID environment variable that Claude Code sets in the
- * MCP server's parent environment.
+ * CLAUDE_CODE_SESSION_ID environment variable. If that is absent, fall back
+ * to the most recently modified transcript for CLAUDE_PROJECT_DIR.
  */
-export function resolveSessionIdArg(value: unknown): string {
+export async function resolveSessionIdArg(value: unknown): Promise<string> {
   if (typeof value === "string" && value.length > 0) return value;
+
   const fromEnv = process.env["CLAUDE_CODE_SESSION_ID"];
   if (typeof fromEnv === "string" && fromEnv.length > 0) return fromEnv;
+
+  const projectDir = process.env["CLAUDE_PROJECT_DIR"];
+  if (typeof projectDir === "string" && projectDir.length > 0) {
+    const latest = await findLatestSessionJsonlForProjectDir(projectDir);
+    if (latest !== null) return latest.sessionId;
+  }
+
   throw new ValidationError(
-    "session_id is required (pass explicitly or set CLAUDE_CODE_SESSION_ID env var)",
+    "session_id is required (pass explicitly, set CLAUDE_CODE_SESSION_ID, or run under Claude Code with CLAUDE_PROJECT_DIR pointing at a project with session transcripts)",
   );
 }

@@ -68,7 +68,7 @@ For development without building, use `tsx` instead:
 }
 ```
 
-CC reads this on session startup and spawns the MCP server as a child process. The server inherits `CLAUDE_CODE_SESSION_ID` from CC's environment, so tool calls don't need to pass `session_id` explicitly.
+CC reads this on session startup and spawns the MCP server as a child process. If `CLAUDE_CODE_SESSION_ID` is present, the shelving server uses it directly. If it is absent, the server falls back to the most recently modified session transcript under the current `CLAUDE_PROJECT_DIR`.
 
 ### 2. Start the proxy
 
@@ -246,7 +246,8 @@ Both:
 |---------|---------|---------|
 | `CLAUDE_SHELVING_DIR` | `~/.claude/shelving` | Registry root |
 | `CLAUDE_PROJECTS_DIR` | `~/.claude/projects` | CC session JSONL root (proxy reads to map UUIDs) |
-| `CLAUDE_CODE_SESSION_ID` | (set by CC) | Default session for MCP tool calls when not passed explicitly |
+| `CLAUDE_CODE_SESSION_ID` | (optional) | Preferred default session for MCP tool calls when not passed explicitly |
+| `CLAUDE_PROJECT_DIR` | (set by CC for MCP stdio servers) | Fallback project root used to infer the latest session transcript when `CLAUDE_CODE_SESSION_ID` is absent |
 
 ## Running as a service
 

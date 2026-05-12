@@ -54,7 +54,7 @@ export const TOOLS: Tool[] = [
         session_id: {
           type: "string",
           description:
-            "Claude Code session UUID. Optional: defaults to the CLAUDE_CODE_SESSION_ID environment variable that Claude Code sets when it spawns this MCP server. Pass explicitly only to target a different session.",
+            "Claude Code session UUID. Optional: defaults to CLAUDE_CODE_SESSION_ID when available; otherwise the server falls back to the most recently modified session transcript for CLAUDE_PROJECT_DIR. Pass explicitly only to target a different session.",
         },
         compressed_uuids: {
           type: "array",
@@ -131,7 +131,7 @@ export const TOOLS: Tool[] = [
         session_id: {
           type: "string",
           description:
-            "Claude Code session UUID. Optional: defaults to the CLAUDE_CODE_SESSION_ID environment variable.",
+            "Claude Code session UUID. Optional: defaults to CLAUDE_CODE_SESSION_ID when available; otherwise falls back to the most recently modified session transcript for CLAUDE_PROJECT_DIR.",
         },
         block_id: {
           type: "integer",
@@ -153,7 +153,7 @@ export const TOOLS: Tool[] = [
         session_id: {
           type: "string",
           description:
-            "Claude Code session UUID. Optional: defaults to the CLAUDE_CODE_SESSION_ID environment variable.",
+            "Claude Code session UUID. Optional: defaults to CLAUDE_CODE_SESSION_ID when available; otherwise falls back to the most recently modified session transcript for CLAUDE_PROJECT_DIR.",
         },
         block_id: {
           type: "integer",
@@ -174,7 +174,7 @@ export const TOOLS: Tool[] = [
         session_id: {
           type: "string",
           description:
-            "Claude Code session UUID. Optional: defaults to the CLAUDE_CODE_SESSION_ID environment variable.",
+            "Claude Code session UUID. Optional: defaults to CLAUDE_CODE_SESSION_ID when available; otherwise falls back to the most recently modified session transcript for CLAUDE_PROJECT_DIR.",
         },
       },
       required: [],
@@ -190,7 +190,7 @@ export const TOOLS: Tool[] = [
         session_id: {
           type: "string",
           description:
-            "Claude Code session UUID. Optional: defaults to the CLAUDE_CODE_SESSION_ID environment variable.",
+            "Claude Code session UUID. Optional: defaults to CLAUDE_CODE_SESSION_ID when available; otherwise falls back to the most recently modified session transcript for CLAUDE_PROJECT_DIR.",
         },
         label: {
           type: "string",
@@ -212,7 +212,7 @@ export const TOOLS: Tool[] = [
         session_id: {
           type: "string",
           description:
-            "Claude Code session UUID. Optional: defaults to the CLAUDE_CODE_SESSION_ID environment variable.",
+            "Claude Code session UUID. Optional: defaults to CLAUDE_CODE_SESSION_ID when available; otherwise falls back to the most recently modified session transcript for CLAUDE_PROJECT_DIR.",
         },
         label: {
           type: "string",
@@ -291,7 +291,7 @@ export async function handleCompress(args: unknown): Promise<ToolResult> {
   let previewOnly: boolean;
   let confirm: boolean;
   try {
-    sessionId = resolveSessionIdArg(a["session_id"]);
+    sessionId = await resolveSessionIdArg(a["session_id"]);
     compressedUuids = optionalStringArray(a["compressed_uuids"], "compressed_uuids");
     startTurn = optionalPositiveInt(a["start_turn"], "start_turn");
     endTurn = optionalPositiveInt(a["end_turn"], "end_turn");
@@ -378,14 +378,39 @@ export async function handleCompress(args: unknown): Promise<ToolResult> {
     const firstMsgIdx = messages.findIndex((m) => m.uuid === startUuid);
     const lastMsgIdx = messages.findLastIndex((m: JsonlMessage) => m.uuid === endUuid);
 
-    let charCount = 0;
-    if (firstMsgIdx !== -1 && lastMsgIdx !== -1) {
-      for (let i = firstMsgIdx; i <= lastMsgIdx; i++) {
-        const msg = messages[i];
-        charCount += msg ? messageContentToString(msg.content).length : 0;
-      }
+    estimatedTokens = estimateTokensForMessageIndexRange(
+      messages,
+      firstMsgIdx,
+      lastMsgIdx,
+    );
+
+    if (previewOnly) {
+      const startUuid = rangeUuids[0];
+      const endUuid = rangeUuids[rangeUuids.length - 1];
+      const anchorSnippet =
+        startUuid !== undefined
+          ? previewSnippetForUuid(messages, startUuid, "start of selected range")
+          : "start of selected range";
+      const endSnippet =
+        endUuid !== undefined
+          ? previewSnippetForUuid(messages, endUuid, "end of selected range")
+          : "end of selected range";
+
+      return successResult({
+        preview: true,
+        session_id: sessionId,
+        start_turn: sIdx + 1,
+        end_turn: eIdx + 1,
+        start_match: `Turn ${sIdx + 1}`,
+        anchor_snippet: anchorSnippet,
+        end_match: `Turn ${eIdx + 1}`,
+        end_snippet: endSnippet,
+        turns: rangeUuids.length,
+        estimated_tokens: estimatedTokens,
+        range_uuids: rangeUuids,
+        note: "Set preview_only=false with summary to perform compression",
+      });
     }
-    estimatedTokens = Math.ceil(charCount / 4);
   } else if (hasPhrase) {
     // Phrase-based range selection
     if (!confirm && !previewOnly) {
@@ -408,9 +433,13 @@ export async function handleCompress(args: unknown): Promise<ToolResult> {
         preview: true,
         session_id: sessionId,
         start_phrase: firstPhrase,
+        start_turn: result.startTurn,
+        end_turn: result.endTurn,
         start_match: startMatch,
+        anchor_snippet: result.anchorSnippet,
         end_phrase: lastPhrase ?? "latest user message",
         end_match: endMatch,
+        end_snippet: result.endSnippet,
         turns: rangeUuids.length,
         estimated_tokens: estimatedTokens,
         range_uuids: rangeUuids,
@@ -427,7 +456,12 @@ export async function handleCompress(args: unknown): Promise<ToolResult> {
       return errorResult(validationError);
     }
     rangeUuids = compressedUuids!;
-    estimatedTokens = originalTokens ?? 0;
+    const firstUuid = compressedUuids![0];
+    const lastUuid = compressedUuids![compressedUuids!.length - 1];
+    estimatedTokens =
+      firstUuid !== undefined && lastUuid !== undefined
+        ? estimateTokensForUuidRange(messages, firstUuid, lastUuid)
+        : 0;
     startMatch = null;
     endMatch = null;
   }
@@ -486,7 +520,16 @@ function findRangeByPhrase(
   firstPhrase: string,
   lastPhrase: string | undefined,
 ):
-  | { uuids: string[]; startMatch: string; endMatch: string; estimatedTokens: number }
+  | {
+      uuids: string[];
+      startMatch: string;
+      endMatch: string;
+      startTurn: number;
+      endTurn: number;
+      anchorSnippet: string;
+      endSnippet: string;
+      estimatedTokens: number;
+    }
   | { error: string } {
   // Find first occurrence of firstPhrase (case-insensitive substring match)
   const lowerFirst = firstPhrase.toLowerCase();
@@ -499,7 +542,7 @@ function findRangeByPhrase(
     const content = messageContentToString(msg.content);
     if (content.toLowerCase().includes(lowerFirst)) {
       startIndex = i;
-      startMatch = content.substring(0, 100) + (content.length > 100 ? "..." : "");
+      startMatch = previewSnippet(content);
       break;
     }
   }
@@ -571,24 +614,61 @@ function findRangeByPhrase(
 
   const uuids = expandedUuidStream.slice(startPos, endPos + 1);
 
-  // Estimate tokens: rough heuristic (4 chars ≈ 1 token, adjusted for typical content)
-  let charCount = 0;
-  for (let i = startPos; i <= endPos; i++) {
-    const idx = messages[i];
-    if (idx !== undefined) {
-      charCount += messageContentToString(idx.content).length;
-    }
-  }
-  const estimatedTokens = Math.ceil(charCount / 4);
+  const estimatedTokens = estimateTokensForUuidRange(messages, startUuid, endUuid);
 
   const endContent = messageContentToString(endMsg.content);
 
   return {
     uuids,
     startMatch,
-    endMatch: endContent.substring(0, 100) + (endContent.length > 100 ? "..." : ""),
+    endMatch: previewSnippet(endContent),
+    startTurn: startPos + 1,
+    endTurn: endPos + 1,
+    anchorSnippet: previewSnippet(messageContentToString(startMsg.content)),
+    endSnippet: previewSnippet(endContent),
     estimatedTokens,
   };
+}
+
+function previewSnippet(content: string): string {
+  return content.substring(0, 100) + (content.length > 100 ? "..." : "");
+}
+
+function previewSnippetForUuid(
+  messages: JsonlMessage[],
+  uuid: string,
+  fallback: string,
+): string {
+  const msg = messages.find((candidate) => candidate.uuid === uuid);
+  return msg ? previewSnippet(messageContentToString(msg.content)) : fallback;
+}
+
+function estimateTokensForUuidRange(
+  messages: JsonlMessage[],
+  startUuid: string,
+  endUuid: string,
+): number {
+  const firstMsgIdx = messages.findIndex((m) => m.uuid === startUuid);
+  const lastMsgIdx = messages.findLastIndex((m: JsonlMessage) => m.uuid === endUuid);
+  return estimateTokensForMessageIndexRange(messages, firstMsgIdx, lastMsgIdx);
+}
+
+function estimateTokensForMessageIndexRange(
+  messages: JsonlMessage[],
+  firstMsgIdx: number,
+  lastMsgIdx: number,
+): number {
+  if (firstMsgIdx === -1 || lastMsgIdx === -1 || firstMsgIdx > lastMsgIdx) {
+    return 0;
+  }
+
+  let charCount = 0;
+  for (let i = firstMsgIdx; i <= lastMsgIdx; i++) {
+    const msg = messages[i];
+    charCount += msg ? messageContentToString(msg.content).length : 0;
+  }
+
+  return Math.ceil(charCount / 4);
 }
 
 function messageContentToString(content: string | unknown[]): string {
@@ -597,16 +677,57 @@ function messageContentToString(content: string | unknown[]): string {
   }
   if (Array.isArray(content)) {
     return content
-      .map((item) => {
-        if (typeof item === "string") return item;
-        if (item && typeof item === "object" && "text" in item) {
-          return String(item.text);
-        }
-        return "";
-      })
+      .map(contentBlockToString)
+      .filter((item) => item.length > 0)
       .join("\n");
   }
   return "";
+}
+
+function contentBlockToString(item: unknown): string {
+  if (typeof item === "string") return item;
+  if (!item || typeof item !== "object") return "";
+
+  const block = item as Record<string, unknown>;
+  if (typeof block["text"] === "string") {
+    return block["text"];
+  }
+
+  if (block["type"] === "thinking" && typeof block["thinking"] === "string") {
+    return block["thinking"];
+  }
+
+  if (block["type"] === "tool_use") {
+    const parts: string[] = [];
+    if (typeof block["name"] === "string") parts.push(block["name"]);
+    if (block["input"] !== undefined) parts.push(stableStringify(block["input"]));
+    return parts.join("\n");
+  }
+
+  if (block["type"] === "tool_result") {
+    const content = block["content"];
+    if (typeof content === "string") return content;
+    if (Array.isArray(content)) {
+      return content
+        .map(contentBlockToString)
+        .filter((part) => part.length > 0)
+        .join("\n");
+    }
+    if (content && typeof content === "object") {
+      return contentBlockToString(content);
+    }
+    return "";
+  }
+
+  return "";
+}
+
+function stableStringify(value: unknown): string {
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
 }
 
 async function validateCompressedRange(
@@ -692,7 +813,7 @@ export async function handleDecompress(args: unknown): Promise<ToolResult> {
   let sessionId: string;
   let blockId: number;
   try {
-    sessionId = resolveSessionIdArg(a["session_id"]);
+    sessionId = await resolveSessionIdArg(a["session_id"]);
     blockId = requirePositiveInt(a["block_id"], "block_id");
   } catch (e) {
     if (e instanceof ValidationError) return errorResult(e.message);
@@ -722,7 +843,7 @@ export async function handleRecompress(args: unknown): Promise<ToolResult> {
   let sessionId: string;
   let blockId: number;
   try {
-    sessionId = resolveSessionIdArg(a["session_id"]);
+    sessionId = await resolveSessionIdArg(a["session_id"]);
     blockId = requirePositiveInt(a["block_id"], "block_id");
   } catch (e) {
     if (e instanceof ValidationError) return errorResult(e.message);
@@ -751,7 +872,7 @@ export async function handleList(args: unknown): Promise<ToolResult> {
 
   let sessionId: string;
   try {
-    sessionId = resolveSessionIdArg(a["session_id"]);
+    sessionId = await resolveSessionIdArg(a["session_id"]);
   } catch (e) {
     if (e instanceof ValidationError) return errorResult(e.message);
     throw e;
@@ -779,7 +900,7 @@ export async function handleStartArc(args: unknown): Promise<ToolResult> {
   let sessionId: string;
   let label: string;
   try {
-    sessionId = resolveSessionIdArg(a["session_id"]);
+    sessionId = await resolveSessionIdArg(a["session_id"]);
     label = requireNonEmptyString(a["label"], "label");
   } catch (e) {
     if (e instanceof ValidationError) return errorResult(e.message);
@@ -832,7 +953,7 @@ export async function handleCompressArc(args: unknown): Promise<ToolResult> {
   let originalTokens: number | undefined;
   let summaryTokens: number | undefined;
   try {
-    sessionId = resolveSessionIdArg(a["session_id"]);
+    sessionId = await resolveSessionIdArg(a["session_id"]);
     label = requireNonEmptyString(a["label"], "label");
     summary = requireNonEmptyString(a["summary"], "summary");
     focus = optionalString(a["focus"], "focus");
@@ -910,6 +1031,11 @@ export async function handleCompressArc(args: unknown): Promise<ToolResult> {
     );
   }
   const compressedUuids = expandedUuidStream.slice(anchorPos, endPos + 1);
+  const estimatedTokens = estimateTokensForUuidRange(
+    messages,
+    bookmark.anchor_uuid,
+    endUuid,
+  );
 
   // Build and persist the block (same shape as handleCompress).
   const blockId = await nextBlockId(sessionId);
@@ -925,7 +1051,7 @@ export async function handleCompressArc(args: unknown): Promise<ToolResult> {
     anchor_uuid: anchorUuid,
     compressed_uuids: compressedUuids,
     summary,
-    original_tokens: originalTokens ?? 0,
+    original_tokens: originalTokens ?? estimatedTokens,
     summary_tokens: summaryTokens ?? 0,
     focus: focus ?? null,
     parent_block_id: null,

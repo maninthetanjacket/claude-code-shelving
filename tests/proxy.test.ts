@@ -152,6 +152,16 @@ async function writeSessionJsonl(
   await writeFile(join(projDir, `${sessionId}.jsonl`), lines.join("\n") + "\n");
 }
 
+async function writeRawSessionJsonl(sessionId: string, lines: unknown[]): Promise<void> {
+  const projectsDir = process.env["CLAUDE_PROJECTS_DIR"]!;
+  const projDir = join(projectsDir, "-test-proj");
+  await mkdir(projDir, { recursive: true });
+  await writeFile(
+    join(projDir, `${sessionId}.jsonl`),
+    lines.map((line) => JSON.stringify(line)).join("\n") + "\n",
+  );
+}
+
 function makeBlock(overrides: Partial<Block>): Block {
   return {
     block_id: 1,
@@ -314,8 +324,66 @@ test("E2E: SSE responses get a turn marker injected before first text delta", as
     const body = await res.text();
     assert.match(
       body,
-      /event: content_block_start[\s\S]*event: content_block_delta\ndata: \{"type": "content_block_delta", "index": 0, "delta": \{"type": "text_delta", "text": "\[turn 4\]\\n\\n"\}\}\n\nevent: content_block_delta[\s\S]*"text":"hello"/,
+      /event: content_block_start[\s\S]*event: content_block_delta\ndata: \{"type": "content_block_delta", "index": 0, "delta": \{"type": "text_delta", "text": "\[turn 5\]\\n\\n"\}\}\n\nevent: content_block_delta[\s\S]*"text":"hello"/,
     );
+  } finally {
+    await proxy.close();
+    await upstream.close();
+  }
+});
+
+test("E2E: SSE turn marker uses collapsed UUID turn numbering", async () => {
+  await writeRawSessionJsonl(SESSION_ID, [
+    {
+      type: "user",
+      uuid: "u1",
+      message: { role: "user", content: "msg1" },
+    },
+    {
+      type: "assistant",
+      uuid: "dup",
+      message: { role: "assistant", content: "first half of duplicated turn" },
+    },
+    {
+      type: "assistant",
+      uuid: "dup",
+      message: { role: "assistant", content: "second half of duplicated turn" },
+    },
+    {
+      type: "user",
+      uuid: "u3",
+      message: { role: "user", content: "msg3" },
+    },
+  ]);
+
+  const upstream = await startFakeUpstream();
+  const proxy = await startProxy(upstream.url);
+  try {
+    upstream.responseContentType = "text/event-stream";
+    upstream.responseBody =
+      'event: message_start\n' +
+      'data: {"type":"message_start"}\n\n' +
+      'event: content_block_start\n' +
+      'data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\n' +
+      'event: content_block_delta\n' +
+      'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hello"}}\n\n';
+
+    const res = await fetch(new URL("/v1/messages", proxy.url), {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-claude-code-session-id": SESSION_ID,
+      },
+      body: JSON.stringify({
+        model: "claude-opus-4.7",
+        messages: [{ role: "user", content: "hello" }],
+      }),
+    });
+
+    assert.equal(res.status, 200);
+    const body = await res.text();
+    assert.match(body, /\[turn 5\]\\n\\n/);
+    assert.doesNotMatch(body, /\[turn 4\]\\n\\n/);
   } finally {
     await proxy.close();
     await upstream.close();

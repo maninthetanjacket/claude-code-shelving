@@ -195,6 +195,16 @@ function adjustResponseHeaders(
   return adjusted;
 }
 
+function collapseConsecutiveDuplicates(values: string[]): string[] {
+  const collapsed: string[] = [];
+  for (const value of values) {
+    if (collapsed[collapsed.length - 1] !== value) {
+      collapsed.push(value);
+    }
+  }
+  return collapsed;
+}
+
 interface ForwardedResponse {
   upstreamRes: IncomingMessage;
   statusCode: number;
@@ -270,7 +280,12 @@ async function pipeUpstreamResponse(
   if (shouldInjectTurnMarker) {
     try {
       const { messages } = await loadSessionMessages(sessionId);
-      turnNumber = messages.length + 1;
+      // At response time, Claude Code may not have appended the current user
+      // turn to the transcript yet. Inject the marker for the assistant reply's
+      // eventual transcript turn so the visible [turn N] aligns with the
+      // persisted JSONL numbering used by the MCP server.
+      turnNumber =
+        collapseConsecutiveDuplicates(messages.map((message) => message.uuid)).length + 2;
     } catch (err) {
       log(
         "info",
