@@ -2,7 +2,7 @@
 
 Deliberate context-shelving for Claude Code. The model invokes a `compress` tool when work is settled enough to be summary-only; a proxy substitutes the registered summary for the original content on subsequent API requests; the session's source-of-truth JSONL stays untouched.
 
-**Status:** Stage 1 working end-to-end and validated against real CC sessions. 108 passing tests including E2E proxy + cache stability and regressions for harness-injected reminders, `tool_use` metadata drift, tool_use anchors embedded in larger multi-block messages, and tool-pair ID matching as a backstop when content bytes drift. The canonical design document lives at `field-guide/shared-space/shelving-design.md` during development.
+**Status:** Stage 1 working end-to-end and validated against real CC sessions. 116 passing tests including E2E proxy + cache stability and regressions for harness-injected reminders, `tool_use` metadata drift, tool_use anchors embedded in larger multi-block messages, and tool-pair ID matching as a backstop when content bytes drift. The proxy injects `[turn N]` markers at the start of assistant responses so the model can address ranges by turn number; `compress` accepts UUID-list, phrase-pair, or turn-range selection. The canonical design document lives at `field-guide/shared-space/shelving-design.md` during development.
 
 ## Architecture
 
@@ -166,17 +166,46 @@ Each entry has a `uuid` field. The model picks the UUIDs it wants to compress (t
 
 ### Compressing
 
-Through the `compress` tool (MCP):
+The `compress` tool accepts three interchangeable ways to specify the range. Pick whichever fits how the model knows the range it wants to shelve.
+
+**Phrase-pair selection.** Address the range by distinctive substrings from its start and end. Typical for arcs whose boundaries are easier to recall as content than as numbers.
+
+```json
+{
+  "first_phrase": "Codex had added a fix to ensure tool calls would get matched by ID",
+  "last_phrase": "Three commits today, all merged",
+  "summary": "What the model wants to preserve as the model's own voice.",
+  "focus": "Optional: what this summary preserved",
+  "preview_only": true
+}
+```
+
+With `preview_only: true`, the server returns the resolved turn range, matched anchor/end snippets, turn count, estimated tokens, and the full UUID list — without compressing. Inspect, then re-call with `confirm: true` (and `preview_only` removed or false) to perform the compression. `last_phrase` is optional; if omitted, the range extends from `first_phrase` to the latest user message in the JSONL.
+
+**Turn-range selection.** Address the range by turn numbers. The proxy injects `[turn N]\n\n` at the start of each assistant response, so the model can see its own turn numbers in flight.
+
+```json
+{
+  "start_turn": 996,
+  "end_turn": 1030,
+  "summary": "...",
+  "focus": "..."
+}
+```
+
+`end_turn` is optional; defaults to the latest user message.
+
+**UUID-list selection.** The original mode. Useful when you've already enumerated the range some other way (e.g., from `find-arc` output or manual JSONL inspection).
 
 ```json
 {
   "compressed_uuids": ["uuid-1", "uuid-2", "uuid-3", "..."],
-  "summary": "What the model wants to preserve as the model's own voice.",
-  "focus": "Optional: what this summary preserved (e.g., 'auth design decisions')"
+  "summary": "...",
+  "focus": "..."
 }
 ```
 
-Returns a `block_id`. On the next API request, the proxy will substitute the summary for the anchor message (first UUID) and drop the rest of the range.
+All three modes return a `block_id`. On the next API request, the proxy substitutes the summary for the anchor message (first message of the range) and drops the rest. Token-count estimates (`original_tokens`, `summary_tokens`) are optional registry metadata; the server estimates `original_tokens` from JSONL content if omitted.
 
 ### Decompressing
 
@@ -249,6 +278,8 @@ Both:
 | `CLAUDE_CODE_SESSION_ID` | (optional) | Preferred default session for MCP tool calls when not passed explicitly |
 | `CLAUDE_PROJECT_DIR` | (set by CC for MCP stdio servers) | Fallback project root used to infer the latest session transcript when `CLAUDE_CODE_SESSION_ID` is absent |
 
+> **Note on Claude Code MCP env propagation.** As observed in practice, recent Claude Code versions do **not** propagate `CLAUDE_CODE_SESSION_ID` or `CLAUDE_PROJECT_DIR` to spawned MCP stdio child processes. The `session_id` argument is therefore the practical path under CC — passing it explicitly on each call. Other MCP hosts (or wrapper scripts that inject these env vars) can rely on the auto-inference fallback. If CC adds env propagation in the future, the fallback will activate without code changes.
+
 ## Running as a service
 
 ### Linux (systemd user unit)
@@ -293,7 +324,7 @@ curl http://127.0.0.1:9802/health
 
 # 2. Run tests
 cd claude-code-shelving && npm test
-# Expected: 108 passing
+# Expected: 116 passing
 
 # 3. From inside a CC session with the MCP server registered, ask the model
 #    to call list_compressions. It should return an empty blocks array.
