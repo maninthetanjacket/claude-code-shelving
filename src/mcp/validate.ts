@@ -64,12 +64,28 @@ export function optionalNonNegativeInt(
   return value;
 }
 
+export function optionalPositiveInt(
+  value: unknown,
+  field: string,
+): number | undefined {
+  if (value === undefined || value === null) return undefined;
+  return requirePositiveInt(value, field);
+}
+
 export function optionalString(value: unknown, field: string): string | undefined {
   if (value === undefined || value === null) return undefined;
   if (typeof value !== "string") {
     throw new ValidationError(`${field} must be a string if provided`);
   }
   return value;
+}
+
+export function optionalNonEmptyString(
+  value: unknown,
+  field: string,
+): string | undefined {
+  if (value === undefined || value === null) return undefined;
+  return requireNonEmptyString(value, field);
 }
 
 /**

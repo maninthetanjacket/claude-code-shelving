@@ -181,6 +181,29 @@ test("compress rejects whitespace-only summary", async () => {
   assert.equal(result.isError, true);
 });
 
+test("compress rejects empty first_phrase", async () => {
+  await writeSimpleSessionJsonl(TEST_SESSION, ["msg_a", "msg_b", "msg_c"]);
+  const result = await handleCompress({
+    session_id: TEST_SESSION,
+    first_phrase: "",
+    preview_only: true,
+  });
+  assert.equal(result.isError, true);
+  assert.match(getText(result), /first_phrase/);
+});
+
+test("compress rejects empty last_phrase", async () => {
+  await writeSimpleSessionJsonl(TEST_SESSION, ["msg_a", "msg_b", "msg_c"]);
+  const result = await handleCompress({
+    session_id: TEST_SESSION,
+    first_phrase: "content-msg_a",
+    last_phrase: "   ",
+    preview_only: true,
+  });
+  assert.equal(result.isError, true);
+  assert.match(getText(result), /last_phrase/);
+});
+
 test("compress falls back to CLAUDE_CODE_SESSION_ID env var when session_id omitted", async () => {
   const prev = process.env["CLAUDE_CODE_SESSION_ID"];
   process.env["CLAUDE_CODE_SESSION_ID"] = TEST_SESSION;

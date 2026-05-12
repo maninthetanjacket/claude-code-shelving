@@ -39,6 +39,7 @@ import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { applySubstitutions } from "./transform.js";
 import { getActiveBlocksCached, getJsonlMessagesCached } from "./cache.js";
+import { loadSessionMessages } from "./jsonl.js";
 
 // ---------------------------------------------------------------------------
 // Config
@@ -174,6 +175,26 @@ function buildResponseHeaders(
   return out;
 }
 
+function isSseContentType(
+  contentType: string | string[] | undefined,
+): boolean {
+  const value = Array.isArray(contentType) ? contentType[0] : contentType;
+  return typeof value === "string" && value.toLowerCase().startsWith("text/event-stream");
+}
+
+function adjustResponseHeaders(
+  headers: Record<string, string | string[]>,
+): Record<string, string | string[]> {
+  if (!isSseContentType(headers["content-type"])) {
+    return headers;
+  }
+
+  const adjusted = { ...headers };
+  delete adjusted["content-length"];
+  delete adjusted["Content-Length"];
+  return adjusted;
+}
+
 interface ForwardedResponse {
   upstreamRes: IncomingMessage;
   statusCode: number;
@@ -235,13 +256,97 @@ function forwardUpstream(
 async function pipeUpstreamResponse(
   upstreamRes: IncomingMessage,
   res: ServerResponse,
+  sessionId: string | null,
+  config: ProxyConfig,
+  log: ReturnType<typeof makeLogger>,
 ): Promise<void> {
-  for await (const chunk of upstreamRes) {
+  const shouldDumpResponse = config.dumpDir !== undefined && sessionId !== null;
+  const shouldInjectTurnMarker =
+    sessionId !== null && isSseContentType(upstreamRes.headers["content-type"]);
+
+  log("debug", `starting pipeUpstreamResponse for session ${sessionId ?? "null"}`);
+
+  let turnNumber: number | null = null;
+  if (shouldInjectTurnMarker) {
+    try {
+      const { messages } = await loadSessionMessages(sessionId);
+      turnNumber = messages.length + 1;
+    } catch (err) {
+      log(
+        "info",
+        `failed to load turn number: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+
+  const responseChunks: Buffer[] = [];
+  const captureChunk = (chunk: Buffer): void => {
+    if (shouldDumpResponse) responseChunks.push(chunk);
+  };
+  const writeChunk = async (chunk: Buffer): Promise<void> => {
+    if (chunk.length === 0) return;
+    captureChunk(chunk);
     const ok = res.write(chunk);
     if (!ok) {
       await once(res, "drain");
     }
+  };
+
+  if (!shouldInjectTurnMarker || turnNumber === null) {
+    for await (const chunk of upstreamRes) {
+      const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      await writeChunk(buf);
+    }
+  } else {
+    let injected = false;
+    let buffer = "";
+
+    for await (const chunk of upstreamRes) {
+      buffer += chunk.toString("utf-8");
+
+      while (buffer.includes("\n\n")) {
+        const index = buffer.indexOf("\n\n");
+        const event = buffer.slice(0, index + 2);
+        buffer = buffer.slice(index + 2);
+        const eventBuf = Buffer.from(event);
+
+        await writeChunk(eventBuf);
+        if (
+          !injected &&
+          event.includes('"type":"content_block_start","index":0,"content_block":{"type":"text"')
+        ) {
+          log("debug", `detected content_block_start, injecting turn ${turnNumber}`);
+          const markerBuf = Buffer.from(
+            `event: content_block_delta\ndata: {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "[turn ${turnNumber}]\\n\\n"}}\n\n`,
+          );
+          await writeChunk(markerBuf);
+          injected = true;
+        }
+      }
+    }
+
+    if (buffer.length > 0) {
+      await writeChunk(Buffer.from(buffer));
+    }
   }
+
+  log("debug", `finished piping chunks for session ${sessionId ?? "null"}`);
+
+  if (shouldDumpResponse) {
+    try {
+      const fullResponse = Buffer.concat(responseChunks);
+      const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+      await mkdir(config.dumpDir!, { recursive: true });
+      await writeFile(
+        join(config.dumpDir!, `response-${sessionId}-${timestamp}.raw`),
+        fullResponse,
+      );
+      log("debug", `dumped response to ${config.dumpDir}/response-${sessionId}-${timestamp}.raw`);
+    } catch (err) {
+      log("info", `response dump failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
   res.end();
 }
 
@@ -399,8 +504,8 @@ async function handleMessages(
     modifiedBuf,
     abortController.signal,
   );
-  res.writeHead(upstream.statusCode, upstream.responseHeaders);
-  await pipeUpstreamResponse(upstream.upstreamRes, res);
+  res.writeHead(upstream.statusCode, adjustResponseHeaders(upstream.responseHeaders));
+  await pipeUpstreamResponse(upstream.upstreamRes, res, sessionId, config, log);
 }
 
 // ---------------------------------------------------------------------------
@@ -411,6 +516,7 @@ async function handlePassthrough(
   req: IncomingMessage,
   res: ServerResponse,
   config: ProxyConfig,
+  log: ReturnType<typeof makeLogger>,
 ): Promise<void> {
   const abortController = new AbortController();
   const abortUpstream = () => {
@@ -420,6 +526,7 @@ async function handlePassthrough(
   req.on("close", abortUpstream);
   res.on("close", abortUpstream);
 
+  const sessionId = resolveSessionId(req.headers);
   const upstreamUrl = new URL(req.url ?? "/", config.upstream);
   const bodyBuf =
     req.method === "GET" || req.method === "HEAD" ? undefined : await readBody(req);
@@ -436,8 +543,8 @@ async function handlePassthrough(
     bodyBuf,
     abortController.signal,
   );
-  res.writeHead(upstream.statusCode, upstream.responseHeaders);
-  await pipeUpstreamResponse(upstream.upstreamRes, res);
+  res.writeHead(upstream.statusCode, adjustResponseHeaders(upstream.responseHeaders));
+  await pipeUpstreamResponse(upstream.upstreamRes, res, sessionId, config, log);
 }
 
 // ---------------------------------------------------------------------------
@@ -463,7 +570,7 @@ export function createProxyServer(config: ProxyConfig): Server {
         ? (r: IncomingMessage, w: ServerResponse) =>
             handleMessages(r, w, config, log)
         : (r: IncomingMessage, w: ServerResponse) =>
-            handlePassthrough(r, w, config);
+            handlePassthrough(r, w, config, log);
 
     handler(req, res).catch((err) => {
       log(

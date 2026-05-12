@@ -16,11 +16,14 @@ import {
   requireStringArray,
   requirePositiveInt,
   optionalNonNegativeInt,
+  optionalNonEmptyString,
+  optionalPositiveInt,
   optionalString,
   resolveSessionIdArg,
   ValidationError,
 } from "./validate.js";
 import { loadSessionMessages } from "../proxy/jsonl.js";
+import type { JsonlMessage } from "../proxy/transform.js";
 
 /**
  * Tool definitions and handlers for the shelving MCP server.
@@ -43,7 +46,8 @@ export const TOOLS: Tool[] = [
       "Compresses a range of messages in a Claude Code session into a single summary. " +
       "On subsequent API requests, the proxy substitutes the summary for the anchor message and drops the rest of the range. " +
       "The original conversation is preserved in the session JSONL on disk and can be restored via decompress. " +
-      "Returns the new block_id.",
+      "Returns the new block_id. Can specify range either by compressed_uuids array, phrase matching (first_phrase + optional last_phrase), or turn numbers (start_turn + optional end_turn). " +
+      "When using phrase matching, returns preview info (turns, tokens) before compression unless confirm=true is passed.",
     inputSchema: {
       type: "object",
       properties: {
@@ -57,13 +61,33 @@ export const TOOLS: Tool[] = [
           items: { type: "string" },
           minItems: 1,
           description:
-            "Ordered list of all message UUIDs in the range to compress. The first UUID becomes the anchor; the summary will appear at this position in the substituted request.",
+            "Ordered list of all message UUIDs in the range to compress. The first UUID becomes the anchor; the summary will appear at this position in the substituted request. Use this OR phrase-based selection (first_phrase) OR turn numbers (start_turn).",
+        },
+        start_turn: {
+          type: "integer",
+          minimum: 1,
+          description: "The starting turn number of the range to compress (1-indexed). Use this OR compressed_uuids OR first_phrase.",
+        },
+        end_turn: {
+          type: "integer",
+          minimum: 1,
+          description: "The ending turn number of the range to compress (1-indexed). Optional; defaults to the latest user message if omitted when using start_turn.",
+        },
+        first_phrase: {
+          type: "string",
+          description:
+            "Text phrase to find the start of the range. Matches substrings in message content. Use with optional last_phrase to define a range, or alone to compress from first match to the most recent user message. Use this OR compressed_uuids.",
+        },
+        last_phrase: {
+          type: "string",
+          description:
+            "Optional text phrase to find the end of the range. If provided, compresses from first_phrase match through last_phrase match. If omitted with first_phrase, compresses from first_phrase to the latest user message.",
         },
         summary: {
           type: "string",
           minLength: 1,
           description:
-            "Summary text that will replace the anchor message's content in subsequent API requests. Author this from a landed place — it is what the model receives in place of the original messages.",
+            "Summary text that will replace the anchor message's content in subsequent API requests. Author this from a landed place — it is what the model receives in place of the original messages. Required unless preview_only=true.",
         },
         focus: {
           type: "string",
@@ -82,8 +106,18 @@ export const TOOLS: Tool[] = [
           description:
             "Approximate token count of the summary itself. Stored as registry metadata.",
         },
+        preview_only: {
+          type: "boolean",
+          description:
+            "If true, only return preview info (turns, tokens, matched phrases) without performing compression. Default false.",
+        },
+        confirm: {
+          type: "boolean",
+          description:
+            "If true, skip preview and proceed directly to compression. Required when using phrase-based selection with preview_only=false.",
+        },
       },
-      required: ["compressed_uuids", "summary"],
+      required: [],
     },
   },
   {
@@ -245,35 +279,168 @@ export async function handleCompress(args: unknown): Promise<ToolResult> {
   const a = args as Record<string, unknown>;
 
   let sessionId: string;
-  let compressedUuids: string[];
-  let summary: string;
+  let compressedUuids: string[] | undefined;
+  let startTurn: number | undefined;
+  let endTurn: number | undefined;
+  let firstPhrase: string | undefined;
+  let lastPhrase: string | undefined;
+  let summary: string | undefined;
   let focus: string | undefined;
   let originalTokens: number | undefined;
   let summaryTokens: number | undefined;
+  let previewOnly: boolean;
+  let confirm: boolean;
   try {
     sessionId = resolveSessionIdArg(a["session_id"]);
-    compressedUuids = requireStringArray(a["compressed_uuids"], "compressed_uuids");
-    summary = requireNonEmptyString(a["summary"], "summary");
+    compressedUuids = optionalStringArray(a["compressed_uuids"], "compressed_uuids");
+    startTurn = optionalPositiveInt(a["start_turn"], "start_turn");
+    endTurn = optionalPositiveInt(a["end_turn"], "end_turn");
+    firstPhrase = optionalNonEmptyString(a["first_phrase"], "first_phrase");
+    lastPhrase = optionalNonEmptyString(a["last_phrase"], "last_phrase");
+    summary = optionalString(a["summary"], "summary");
     focus = optionalString(a["focus"], "focus");
     originalTokens = optionalNonNegativeInt(a["original_tokens"], "original_tokens");
     summaryTokens = optionalNonNegativeInt(a["summary_tokens"], "summary_tokens");
+    previewOnly = optionalBoolean(a["preview_only"], "preview_only") ?? false;
+    confirm = optionalBoolean(a["confirm"], "confirm") ?? false;
   } catch (e) {
     if (e instanceof ValidationError) return errorResult(e.message);
     throw e;
   }
 
-  const blockId = await nextBlockId(sessionId);
-  const anchorUuid = compressedUuids[0];
-  if (anchorUuid === undefined) {
-    // requireStringArray already enforces minItems >= 1, but TS narrowing
-    // still wants a guard since compressed_uuids[0] is T | undefined under
-    // noUncheckedIndexedAccess.
-    return errorResult("compressed_uuids must contain at least one UUID");
+  // Validate argument combinations
+  const hasUuids = compressedUuids !== undefined && compressedUuids.length > 0;
+  const hasPhrase = firstPhrase !== undefined;
+  const hasTurns = startTurn !== undefined;
+
+  if (!hasUuids && !hasPhrase && !hasTurns) {
+    return errorResult(
+      "Must provide either compressed_uuids array, first_phrase, or start_turn for range selection"
+    );
+  }
+  if ((hasUuids && hasPhrase) || (hasUuids && hasTurns) || (hasPhrase && hasTurns)) {
+    return errorResult(
+      "Cannot specify multiple range selection methods; choose either compressed_uuids, phrase matching, or turn numbers"
+    );
   }
 
-  const validationError = await validateCompressedRange(sessionId, compressedUuids);
-  if (validationError !== null) {
-    return errorResult(validationError);
+  // Load session messages for phrase matching or preview
+  const { path, messages } = await loadSessionMessages(sessionId);
+  if (path === null) {
+    return errorResult(`Session JSONL not found for session ${sessionId}`);
+  }
+
+  let rangeUuids: string[];
+  let startMatch: string | null;
+  let endMatch: string | null;
+  let estimatedTokens: number;
+
+  if (hasTurns) {
+    // Turn-based range selection (1-indexed, based on collapsed UUID stream)
+    const collapsedUuids = collapseConsecutiveDuplicates(messages.map((m) => m.uuid));
+    const sIdx = startTurn! - 1;
+    let eIdx = -1;
+
+    if (endTurn !== undefined) {
+      eIdx = endTurn - 1;
+    } else {
+      // Default to the most recent user message in the session
+      for (let i = messages.length - 1; i >= sIdx; i--) {
+        const msg = messages[i];
+        if (msg && msg.role === "user") {
+          const uuid = msg.uuid;
+          // Find the last occurrence of this UUID in the collapsed stream
+          for (let j = collapsedUuids.length - 1; j >= sIdx; j--) {
+            if (collapsedUuids[j] === uuid) {
+              eIdx = j;
+              break;
+            }
+          }
+          if (eIdx !== -1) break;
+        }
+      }
+      if (eIdx === -1) eIdx = collapsedUuids.length - 1;
+    }
+
+    if (sIdx < 0 || sIdx >= collapsedUuids.length) {
+      return errorResult(`start_turn ${startTurn} is out of bounds (1-${collapsedUuids.length})`);
+    }
+    if (eIdx < sIdx || eIdx >= collapsedUuids.length) {
+      return errorResult(`end_turn ${endTurn ?? "latest user message"} is out of bounds or before start_turn`);
+    }
+
+    rangeUuids = collapsedUuids.slice(sIdx, eIdx + 1);
+    startMatch = `Turn ${sIdx + 1}`;
+    endMatch = `Turn ${eIdx + 1}`;
+
+    const startUuid = collapsedUuids[sIdx];
+    const endUuid = collapsedUuids[eIdx];
+    const firstMsgIdx = messages.findIndex((m) => m.uuid === startUuid);
+    const lastMsgIdx = messages.findLastIndex((m: JsonlMessage) => m.uuid === endUuid);
+
+    let charCount = 0;
+    if (firstMsgIdx !== -1 && lastMsgIdx !== -1) {
+      for (let i = firstMsgIdx; i <= lastMsgIdx; i++) {
+        const msg = messages[i];
+        charCount += msg ? messageContentToString(msg.content).length : 0;
+      }
+    }
+    estimatedTokens = Math.ceil(charCount / 4);
+  } else if (hasPhrase) {
+    // Phrase-based range selection
+    if (!confirm && !previewOnly) {
+      return errorResult(
+        "Phrase-based selection requires confirm=true to proceed, or set preview_only=true to preview first"
+      );
+    }
+    const result = findRangeByPhrase(messages, firstPhrase!, lastPhrase);
+    if ("error" in result) {
+      return errorResult(result.error);
+    }
+    rangeUuids = result.uuids;
+    startMatch = result.startMatch;
+    endMatch = result.endMatch;
+    estimatedTokens = result.estimatedTokens;
+
+    // Return preview if requested
+    if (previewOnly) {
+      return successResult({
+        preview: true,
+        session_id: sessionId,
+        start_phrase: firstPhrase,
+        start_match: startMatch,
+        end_phrase: lastPhrase ?? "latest user message",
+        end_match: endMatch,
+        turns: rangeUuids.length,
+        estimated_tokens: estimatedTokens,
+        range_uuids: rangeUuids,
+        note: "Pass confirm=true with summary to perform compression",
+      });
+    }
+  } else {
+    // UUID-based range selection (original behavior)
+    if (compressedUuids!.length === 0) {
+      return errorResult("compressed_uuids must contain at least one UUID");
+    }
+    const validationError = await validateCompressedRange(sessionId, compressedUuids!);
+    if (validationError !== null) {
+      return errorResult(validationError);
+    }
+    rangeUuids = compressedUuids!;
+    estimatedTokens = originalTokens ?? 0;
+    startMatch = null;
+    endMatch = null;
+  }
+
+  // Require summary for actual compression
+  if (summary === undefined || summary.trim().length === 0) {
+    return errorResult("summary is required for compression");
+  }
+
+  const blockId = await nextBlockId(sessionId);
+  const anchorUuid = rangeUuids[0];
+  if (anchorUuid === undefined) {
+    return errorResult("range produced an empty UUID list");
   }
 
   const block: Block = {
@@ -281,9 +448,9 @@ export async function handleCompress(args: unknown): Promise<ToolResult> {
     created_at: new Date().toISOString(),
     active: true,
     anchor_uuid: anchorUuid,
-    compressed_uuids: compressedUuids,
+    compressed_uuids: rangeUuids,
     summary,
-    original_tokens: originalTokens ?? 0,
+    original_tokens: originalTokens ?? estimatedTokens,
     summary_tokens: summaryTokens ?? 0,
     focus: focus ?? null,
     parent_block_id: null,
@@ -294,11 +461,152 @@ export async function handleCompress(args: unknown): Promise<ToolResult> {
   return successResult({
     block_id: blockId,
     anchor_uuid: anchorUuid,
-    compressed_count: compressedUuids.length,
+    compressed_count: rangeUuids.length,
     original_tokens: block.original_tokens,
     summary_tokens: block.summary_tokens,
     active: true,
   });
+}
+
+function optionalStringArray(value: unknown, field: string): string[] | undefined {
+  if (value === undefined || value === null) return undefined;
+  return requireStringArray(value, field);
+}
+
+function optionalBoolean(value: unknown, field: string): boolean | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value !== "boolean") {
+    throw new ValidationError(`${field} must be a boolean if provided`);
+  }
+  return value;
+}
+
+function findRangeByPhrase(
+  messages: JsonlMessage[],
+  firstPhrase: string,
+  lastPhrase: string | undefined,
+):
+  | { uuids: string[]; startMatch: string; endMatch: string; estimatedTokens: number }
+  | { error: string } {
+  // Find first occurrence of firstPhrase (case-insensitive substring match)
+  const lowerFirst = firstPhrase.toLowerCase();
+  let startIndex = -1;
+  let startMatch = "";
+
+  for (let i = 0; i < messages.length; i++) {
+    const msg = messages[i];
+    if (msg === undefined) continue;
+    const content = messageContentToString(msg.content);
+    if (content.toLowerCase().includes(lowerFirst)) {
+      startIndex = i;
+      startMatch = content.substring(0, 100) + (content.length > 100 ? "..." : "");
+      break;
+    }
+  }
+
+  if (startIndex === -1) {
+    return { error: `Could not find first phrase "${firstPhrase}" in any message content` };
+  }
+
+  // Determine end index
+  let endIndex = startIndex;
+  if (lastPhrase !== undefined) {
+    // Find first occurrence of lastPhrase at or after startIndex
+    const lowerLast = lastPhrase.toLowerCase();
+    for (let i = startIndex; i < messages.length; i++) {
+      const msg = messages[i];
+      if (msg === undefined) continue;
+      const content = messageContentToString(msg.content);
+      if (content.toLowerCase().includes(lowerLast)) {
+        endIndex = i;
+        break;
+      }
+    }
+    const startMsg = messages[startIndex];
+    if (endIndex === startIndex && startMsg !== undefined) {
+      const startContent = messageContentToString(startMsg.content);
+      if (!startContent.toLowerCase().includes(lowerLast)) {
+        return { error: `Could not find last phrase "${lastPhrase}" in messages after first match` };
+      }
+    }
+  } else {
+    // Find the most recent user message
+    for (let i = messages.length - 1; i >= startIndex; i--) {
+      const msg = messages[i];
+      if (msg === undefined) continue;
+      if (msg.role === "user") {
+        endIndex = i;
+        break;
+      }
+    }
+  }
+
+  const startMsg = messages[startIndex];
+  const endMsg = messages[endIndex];
+  if (startMsg === undefined || endMsg === undefined) {
+    return { error: "Could not resolve messages at matched positions" };
+  }
+
+  // Collect UUIDs in the range, collapsing consecutive duplicates
+  const expandedUuidStream = collapseConsecutiveDuplicates(
+    messages.map((m) => m.uuid)
+  );
+
+  // Find positions in the collapsed stream
+  const startUuid = startMsg.uuid;
+  const endUuid = endMsg.uuid;
+
+  const startPos = expandedUuidStream.indexOf(startUuid);
+  let endPos = -1;
+  for (let i = expandedUuidStream.length - 1; i >= 0; i--) {
+    if (expandedUuidStream[i] === endUuid) {
+      endPos = i;
+      break;
+    }
+  }
+
+  if (startPos === -1 || endPos === -1 || startPos > endPos) {
+    return { error: "Could not resolve contiguous range from phrase matches" };
+  }
+
+  const uuids = expandedUuidStream.slice(startPos, endPos + 1);
+
+  // Estimate tokens: rough heuristic (4 chars ≈ 1 token, adjusted for typical content)
+  let charCount = 0;
+  for (let i = startPos; i <= endPos; i++) {
+    const idx = messages[i];
+    if (idx !== undefined) {
+      charCount += messageContentToString(idx.content).length;
+    }
+  }
+  const estimatedTokens = Math.ceil(charCount / 4);
+
+  const endContent = messageContentToString(endMsg.content);
+
+  return {
+    uuids,
+    startMatch,
+    endMatch: endContent.substring(0, 100) + (endContent.length > 100 ? "..." : ""),
+    estimatedTokens,
+  };
+}
+
+function messageContentToString(content: string | unknown[]): string {
+  if (typeof content === "string") {
+    return content;
+  }
+  if (Array.isArray(content)) {
+    return content
+      .map((item) => {
+        if (typeof item === "string") return item;
+        if (item && typeof item === "object" && "text" in item) {
+          return String(item.text);
+        }
+        return "";
+      })
+      .join("\n");
+  }
+  return "";
 }
 
 async function validateCompressedRange(
