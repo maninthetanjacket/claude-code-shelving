@@ -257,12 +257,89 @@ export function applySubstitutions(
     .sort((a, b) => a - b);
 
   return {
-    request: { ...request, messages: newMessages },
+    request: { ...request, messages: normalizeMessageSequence(newMessages) },
     anchors_substituted: anchorsSubstituted,
     messages_dropped: messagesDropped,
     blocks_applied: blocksAppliedList,
     blocks_inactive_in_request: blocksInactive,
   };
+}
+
+/**
+ * Repair the message sequence after substitution + drop.
+ *
+ * Dropping UUID-matched conversation turns can strand the non-UUID artifacts
+ * that CC interleaves into a request — chiefly `role:"system"` reminders, which
+ * have no JSONL UUID and therefore pass through the matcher untouched. Two
+ * invalid shapes result, both of which the API rejects:
+ *
+ *  1. Orphaned system reminders. A reminder is only valid immediately before an
+ *     assistant turn (or at the end of the array). When the assistant turn it
+ *     preceded is dropped, the reminder is left in front of a `user` message and
+ *     the API returns: "role 'system' must precede an 'assistant' message or end
+ *     the array."
+ *
+ *  2. Same-role adjacency. Collapsing a range whose anchor is a user message and
+ *     whose following message is also a user message leaves two user turns back
+ *     to back once the assistant turns between them are gone.
+ *
+ * This pass fixes both: it drops system reminders that no longer precede an
+ * assistant message (or end the array), then merges any consecutive same-role
+ * user/assistant messages. It is a no-op on an already-valid sequence, so it
+ * leaves untouched passthrough requests byte-identical.
+ */
+function normalizeMessageSequence(messages: ApiMessage[]): ApiMessage[] {
+  // 1. Prune orphaned system reminders.
+  const pruned: ApiMessage[] = [];
+  for (let i = 0; i < messages.length; i++) {
+    const message = messages[i];
+    if (message === undefined) continue;
+    if ((message.role as string) === "system") {
+      let j = i + 1;
+      while (j < messages.length && (messages[j]?.role as string) === "system") {
+        j++;
+      }
+      const next = messages[j];
+      // Keep only if the run is terminated by an assistant turn or by the end
+      // of the array; otherwise the reminder is orphaned and must be dropped.
+      if (next === undefined || next.role === "assistant") {
+        pruned.push(message);
+      }
+      continue;
+    }
+    pruned.push(message);
+  }
+
+  // 2. Merge consecutive same-role user/assistant messages.
+  const merged: ApiMessage[] = [];
+  for (const message of pruned) {
+    const prev = merged[merged.length - 1];
+    if (
+      prev !== undefined &&
+      prev.role === message.role &&
+      (message.role === "user" || message.role === "assistant")
+    ) {
+      prev.content = mergeContents(prev.content, message.content);
+    } else {
+      // Shallow copy so merges never mutate the caller's request objects.
+      merged.push({ ...message });
+    }
+  }
+  return merged;
+}
+
+function mergeContents(
+  a: string | unknown[],
+  b: string | unknown[],
+): unknown[] {
+  return [...contentToBlocks(a), ...contentToBlocks(b)];
+}
+
+function contentToBlocks(content: string | unknown[]): unknown[] {
+  if (typeof content === "string") {
+    return content.length > 0 ? [{ type: "text", text: content }] : [];
+  }
+  return content;
 }
 
 /**

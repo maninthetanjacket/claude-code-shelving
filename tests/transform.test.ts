@@ -33,6 +33,17 @@ function makeRequest(messages: ApiMessage[], extras: Record<string, unknown> = {
   return { messages, ...extras };
 }
 
+/** Assert no two adjacent messages share a role (the post-merge invariant). */
+function assertAlternates(messages: ApiMessage[]): void {
+  for (let i = 1; i < messages.length; i++) {
+    assert.notEqual(
+      messages[i]?.role,
+      messages[i - 1]?.role,
+      `messages ${i - 1} and ${i} share role ${String(messages[i]?.role)}`,
+    );
+  }
+}
+
 test("no active blocks: request passes through unchanged", () => {
   const request = makeRequest([
     { role: "user", content: "hello" },
@@ -69,21 +80,19 @@ test("simple substitution: contiguous range collapses to summary at anchor", () 
 
   const result = applySubstitutions(request, jsonl, [block]);
 
-  assert.equal(result.request.messages.length, 3);
-  assert.equal(result.request.messages[0]?.content, "first");
-  assert.match(
-    result.request.messages[1]?.content as string,
-    /Three messages collapsed\./,
-  );
-  assert.match(
-    result.request.messages[1]?.content as string,
-    /\[shelved: block 1, 3 messages\]/,
-  );
-  assert.equal(result.request.messages[2]?.content, "last");
-
+  // Substitution mechanics: anchor replaced, two messages dropped.
   assert.equal(result.anchors_substituted, 1);
   assert.equal(result.messages_dropped, 2);
   assert.deepEqual(result.blocks_applied, [1]);
+
+  // The surviving same-role neighbours (all "user" here) fold into the summary
+  // message, leaving a well-formed sequence with the content preserved.
+  assertAlternates(result.request.messages);
+  const text = JSON.stringify(result.request.messages);
+  assert.match(text, /first/);
+  assert.match(text, /Three messages collapsed\./);
+  assert.match(text, /\[shelved: block 1, 3 messages\]/);
+  assert.match(text, /last/);
 });
 
 test("anchor preserves the original message's role", () => {
@@ -176,10 +185,14 @@ test("UUID in block but not in JSONL: that message can't be matched, passes thro
   });
 
   const result = applySubstitutions(request, jsonl, [block]);
-  // u1 substitutes (anchor); u2 not in jsonl so msg2 passes through
-  assert.equal(result.request.messages.length, 2);
-  assert.match(result.request.messages[0]?.content as string, /Test summary/);
-  assert.equal(result.request.messages[1]?.content, "msg2");
+  // u1 substitutes (anchor); u2 not in jsonl so msg2 passes through. Both are
+  // user-role, so the merge folds them into one well-formed message that keeps
+  // the summary and the passed-through content.
+  assert.equal(result.anchors_substituted, 1);
+  assertAlternates(result.request.messages);
+  const text = JSON.stringify(result.request.messages);
+  assert.match(text, /Test summary/);
+  assert.match(text, /msg2/);
 });
 
 test("array-form content is matched by JSON serialization", () => {
@@ -744,13 +757,19 @@ test("multiple non-overlapping blocks: each applied independently", () => {
   });
 
   const result = applySubstitutions(request, jsonl, [blockA, blockB]);
-  assert.equal(result.request.messages.length, 3);
-  assert.match(result.request.messages[0]?.content as string, /A summary/);
-  assert.equal(result.request.messages[1]?.content, "middle");
-  assert.match(result.request.messages[2]?.content as string, /B summary/);
+
+  // Both blocks apply independently: two anchors substituted, two dropped.
   assert.deepEqual(result.blocks_applied, [1, 2]);
   assert.equal(result.anchors_substituted, 2);
   assert.equal(result.messages_dropped, 2);
+
+  // All survivors are user-role here, so they fold into a single well-formed
+  // message carrying both summaries and the middle passthrough.
+  assertAlternates(result.request.messages);
+  const text = JSON.stringify(result.request.messages);
+  assert.match(text, /A summary/);
+  assert.match(text, /middle/);
+  assert.match(text, /B summary/);
 });
 
 test("block does not partially apply when only non-anchor tool_result is present", () => {
@@ -846,4 +865,98 @@ test("determinism: same inputs produce byte-identical output", () => {
   const r1 = applySubstitutions(request, jsonl, [block]);
   const r2 = applySubstitutions(request, jsonl, [block]);
   assert.equal(JSON.stringify(r1.request), JSON.stringify(r2.request));
+});
+
+// CC interleaves `role:"system"` reminders that have no JSONL UUID, so the
+// matcher passes them through. Dropping the assistant turns they preceded used
+// to strand them (API: "role 'system' must precede an 'assistant' message or
+// end the array") and could leave the user anchor adjacent to a following user
+// turn. normalizeMessageSequence must repair both.
+const sys = (content: string): ApiMessage =>
+  ({ role: "system", content } as unknown as ApiMessage);
+
+test("orphaned system reminders are pruned and same-role turns merged", () => {
+  const request = makeRequest([
+    { role: "user", content: "opening" }, // anchor
+    sys("reminder A"), // preceded the now-dropped turn2
+    { role: "assistant", content: "turn2" }, // drop
+    { role: "user", content: "turn3" }, // drop
+    sys("reminder B"), // preceded the now-dropped turn4
+    { role: "assistant", content: "turn4" }, // drop
+    { role: "user", content: "yep looks great" }, // survives (post-range)
+    { role: "assistant", content: "reply" }, // survives
+    { role: "user", content: "tool follow-up" }, // survives
+  ]);
+
+  const jsonl = makeJsonl([
+    ["u1", "user", "opening"],
+    ["u2", "assistant", "turn2"],
+    ["u3", "user", "turn3"],
+    ["u4", "assistant", "turn4"],
+    ["u5", "user", "yep looks great"],
+    ["u6", "assistant", "reply"],
+    ["u7", "user", "tool follow-up"],
+  ]);
+
+  const block = makeBlock({
+    anchor_uuid: "u1",
+    compressed_uuids: ["u1", "u2", "u3", "u4"],
+    summary: "Collapsed opening arc.",
+  });
+
+  const result = applySubstitutions(request, jsonl, [block]);
+  const msgs = result.request.messages;
+
+  // No system reminder survived (both were orphaned by the dropped assistants).
+  assert.equal(
+    msgs.filter((m) => (m.role as string) === "system").length,
+    0,
+  );
+  // No two consecutive messages share a role.
+  for (let i = 1; i < msgs.length; i++) {
+    assert.notEqual(
+      msgs[i]?.role,
+      msgs[i - 1]?.role,
+      `messages ${i - 1} and ${i} share role ${msgs[i]?.role}`,
+    );
+  }
+  // The anchor (user) merged with the following user turn: summary + "yep".
+  assert.equal(msgs[0]?.role, "user");
+  const firstText = JSON.stringify(msgs[0]?.content);
+  assert.match(firstText, /Collapsed opening arc\./);
+  assert.match(firstText, /yep looks great/);
+  // Sequence is user → assistant → user.
+  assert.deepEqual(msgs.map((m) => m.role), ["user", "assistant", "user"]);
+});
+
+test("a system reminder that still precedes an assistant is preserved", () => {
+  const request = makeRequest([
+    { role: "user", content: "opening" }, // anchor
+    { role: "assistant", content: "drop me" }, // drop
+    sys("live reminder"), // still precedes a surviving assistant
+    { role: "assistant", content: "real reply" }, // survives
+    { role: "user", content: "follow up" }, // survives
+  ]);
+
+  const jsonl = makeJsonl([
+    ["u1", "user", "opening"],
+    ["u2", "assistant", "drop me"],
+    ["u3", "assistant", "real reply"],
+    ["u4", "user", "follow up"],
+  ]);
+
+  const block = makeBlock({
+    anchor_uuid: "u1",
+    compressed_uuids: ["u1", "u2"],
+    summary: "Collapsed.",
+  });
+
+  const result = applySubstitutions(request, jsonl, [block]);
+  const msgs = result.request.messages;
+
+  // The live reminder is retained, still immediately before an assistant turn.
+  const sysIdx = msgs.findIndex((m) => (m.role as string) === "system");
+  assert.notEqual(sysIdx, -1, "live reminder should be preserved");
+  assert.equal(msgs[sysIdx + 1]?.role, "assistant");
+  assert.equal(msgs[sysIdx]?.content, "live reminder");
 });

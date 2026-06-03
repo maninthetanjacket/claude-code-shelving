@@ -299,14 +299,23 @@ test("E2E: SSE responses get a turn marker injected before first text delta", as
   const upstream = await startFakeUpstream();
   const proxy = await startProxy(upstream.url);
   try {
+    // Real turns run with thinking enabled: index 0 is a thinking block and
+    // the visible text block lands at index 1. The marker must be detected at,
+    // and injected against, that text index — not a hardcoded index 0.
     upstream.responseContentType = "text/event-stream";
     upstream.responseBody =
       'event: message_start\n' +
       'data: {"type":"message_start"}\n\n' +
       'event: content_block_start\n' +
-      'data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\n' +
+      'data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}\n\n' +
       'event: content_block_delta\n' +
-      'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hello"}}\n\n';
+      'data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"hmm"}}\n\n' +
+      'event: content_block_stop\n' +
+      'data: {"type":"content_block_stop","index":0}\n\n' +
+      'event: content_block_start\n' +
+      'data: {"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}\n\n' +
+      'event: content_block_delta\n' +
+      'data: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"hello"}}\n\n';
 
     const res = await fetch(new URL("/v1/messages", proxy.url), {
       method: "POST",
@@ -316,16 +325,21 @@ test("E2E: SSE responses get a turn marker injected before first text delta", as
       },
       body: JSON.stringify({
         model: "claude-opus-4.7",
+        thinking: { type: "adaptive", display: "summarized" },
         messages: [{ role: "user", content: "hello" }],
       }),
     });
 
     assert.equal(res.status, 200);
     const body = await res.text();
+    // Marker injected as a text_delta against index 1, after the text block
+    // starts and before the upstream "hello" delta.
     assert.match(
       body,
-      /event: content_block_start[\s\S]*event: content_block_delta\ndata: \{"type": "content_block_delta", "index": 0, "delta": \{"type": "text_delta", "text": "\[turn 5\]\\n\\n"\}\}\n\nevent: content_block_delta[\s\S]*"text":"hello"/,
+      /"type":"content_block_start","index":1[\s\S]*event: content_block_delta\ndata: \{"type": "content_block_delta", "index": 1, "delta": \{"type": "text_delta", "text": "\[turn 5\]\\n\\n"\}\}\n\nevent: content_block_delta[\s\S]*"text":"hello"/,
     );
+    // The thinking block at index 0 must be left untouched.
+    assert.doesNotMatch(body, /"index": 0, "delta": \{"type": "text_delta", "text": "\[turn/);
   } finally {
     await proxy.close();
     await upstream.close();
@@ -376,6 +390,7 @@ test("E2E: SSE turn marker uses collapsed UUID turn numbering", async () => {
       },
       body: JSON.stringify({
         model: "claude-opus-4.7",
+        thinking: { type: "adaptive", display: "summarized" },
         messages: [{ role: "user", content: "hello" }],
       }),
     });
@@ -384,6 +399,50 @@ test("E2E: SSE turn marker uses collapsed UUID turn numbering", async () => {
     const body = await res.text();
     assert.match(body, /\[turn 5\]\\n\\n/);
     assert.doesNotMatch(body, /\[turn 4\]\\n\\n/);
+  } finally {
+    await proxy.close();
+    await upstream.close();
+  }
+});
+
+test("E2E: auxiliary requests (single message, no thinking) get no turn marker", async () => {
+  // Title generation / quota pings are single-message and carry no `thinking`.
+  // Injecting a marker prepends "[turn N]\n\n" onto the JSON they emit and
+  // corrupts CC-side parsing, so they must be left alone even though their
+  // upstream stream opens with a text block at index 0.
+  await writeSessionJsonl(SESSION_ID, [
+    { uuid: "u1", role: "user", content: "msg1" },
+    { uuid: "a1", role: "assistant", content: "msg2" },
+    { uuid: "u2", role: "user", content: "msg3" },
+  ]);
+
+  const upstream = await startFakeUpstream();
+  const proxy = await startProxy(upstream.url);
+  try {
+    upstream.responseContentType = "text/event-stream";
+    upstream.responseBody =
+      'event: message_start\n' +
+      'data: {"type":"message_start"}\n\n' +
+      'event: content_block_start\n' +
+      'data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\n' +
+      'event: content_block_delta\n' +
+      'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"{\\"title\\":\\"x\\"}"}}\n\n';
+
+    const res = await fetch(new URL("/v1/messages", proxy.url), {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-claude-code-session-id": SESSION_ID,
+      },
+      body: JSON.stringify({
+        model: "claude-opus-4.7",
+        messages: [{ role: "user", content: "name this chat" }],
+      }),
+    });
+
+    assert.equal(res.status, 200);
+    const body = await res.text();
+    assert.doesNotMatch(body, /\[turn/);
   } finally {
     await proxy.close();
     await upstream.close();
@@ -433,11 +492,16 @@ test("E2E: substitutes anchor and drops covered messages", async () => {
     assert.equal(res.status, 200);
 
     const upstreamBody = JSON.parse(upstream.captured[0]?.body ?? "{}");
-    assert.equal(upstreamBody.messages.length, 3);
-    assert.equal(upstreamBody.messages[0].content, "pre");
-    assert.match(upstreamBody.messages[1].content, /Three messages, collapsed\./);
-    assert.match(upstreamBody.messages[1].content, /\[shelved: block 1, 3 messages — decisions about auth\]/);
-    assert.equal(upstreamBody.messages[2].content, "post");
+    // pre / summary / post are all user-role, so they fold into one well-formed
+    // message. No two adjacent messages may share a role.
+    for (let i = 1; i < upstreamBody.messages.length; i++) {
+      assert.notEqual(upstreamBody.messages[i].role, upstreamBody.messages[i - 1].role);
+    }
+    const text = JSON.stringify(upstreamBody.messages);
+    assert.match(text, /pre/);
+    assert.match(text, /Three messages, collapsed\./);
+    assert.match(text, /\[shelved: block 1, 3 messages — decisions about auth\]/);
+    assert.match(text, /post/);
   } finally {
     await proxy.close();
     await upstream.close();

@@ -269,10 +269,13 @@ async function pipeUpstreamResponse(
   sessionId: string | null,
   config: ProxyConfig,
   log: ReturnType<typeof makeLogger>,
+  markerEligible: boolean,
 ): Promise<void> {
   const shouldDumpResponse = config.dumpDir !== undefined && sessionId !== null;
   const shouldInjectTurnMarker =
-    sessionId !== null && isSseContentType(upstreamRes.headers["content-type"]);
+    markerEligible &&
+    sessionId !== null &&
+    isSseContentType(upstreamRes.headers["content-type"]);
 
   log("debug", `starting pipeUpstreamResponse for session ${sessionId ?? "null"}`);
 
@@ -326,13 +329,20 @@ async function pipeUpstreamResponse(
         const eventBuf = Buffer.from(event);
 
         await writeChunk(eventBuf);
-        if (
-          !injected &&
-          event.includes('"type":"content_block_start","index":0,"content_block":{"type":"text"')
-        ) {
-          log("debug", `detected content_block_start, injecting turn ${turnNumber}`);
+        // Match the first *text* content block at whatever index it lands on.
+        // With extended/adaptive thinking enabled, index 0 is a thinking block
+        // and the visible text block moves to index 1+, so we must not pin the
+        // index — and the injected delta has to target the same index.
+        const startMatch = injected
+          ? null
+          : event.match(
+              /"type":"content_block_start","index":(\d+),"content_block":\{"type":"text"/,
+            );
+        if (startMatch) {
+          const textIndex = Number(startMatch[1]);
+          log("debug", `detected text block at index ${textIndex}, injecting turn ${turnNumber}`);
           const markerBuf = Buffer.from(
-            `event: content_block_delta\ndata: {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "[turn ${turnNumber}]\\n\\n"}}\n\n`,
+            `event: content_block_delta\ndata: {"type": "content_block_delta", "index": ${textIndex}, "delta": {"type": "text_delta", "text": "[turn ${turnNumber}]\\n\\n"}}\n\n`,
           );
           await writeChunk(markerBuf);
           injected = true;
@@ -434,6 +444,22 @@ async function handleMessages(
   let modifiedBuf = bodyBuf;
   let transformInfo = "passthrough";
 
+  // Only real conversation turns get a [turn N] marker. The auxiliary
+  // requests CC fires (title generation, quota pings) are single-message and
+  // carry no `thinking`; injecting into them prepends "[turn N]\n\n" onto the
+  // JSON they emit and corrupts CC-side parsing.
+  let markerEligible = false;
+  try {
+    const probe = JSON.parse(bodyBuf.toString("utf-8"));
+    if (probe !== null && typeof probe === "object") {
+      const hasThinking = probe.thinking !== undefined && probe.thinking !== null;
+      const msgCount = Array.isArray(probe.messages) ? probe.messages.length : 0;
+      markerEligible = hasThinking || msgCount > 1;
+    }
+  } catch {
+    // Non-JSON body: leave markerEligible false.
+  }
+
   // Captured for the dump file when SHELVING_PROXY_DUMP_DIR is set.
   let dumpMeta: Record<string, unknown> = {
     timestamp: new Date().toISOString(),
@@ -520,7 +546,7 @@ async function handleMessages(
     abortController.signal,
   );
   res.writeHead(upstream.statusCode, adjustResponseHeaders(upstream.responseHeaders));
-  await pipeUpstreamResponse(upstream.upstreamRes, res, sessionId, config, log);
+  await pipeUpstreamResponse(upstream.upstreamRes, res, sessionId, config, log, markerEligible);
 }
 
 // ---------------------------------------------------------------------------
@@ -559,7 +585,7 @@ async function handlePassthrough(
     abortController.signal,
   );
   res.writeHead(upstream.statusCode, adjustResponseHeaders(upstream.responseHeaders));
-  await pipeUpstreamResponse(upstream.upstreamRes, res, sessionId, config, log);
+  await pipeUpstreamResponse(upstream.upstreamRes, res, sessionId, config, log, false);
 }
 
 // ---------------------------------------------------------------------------
