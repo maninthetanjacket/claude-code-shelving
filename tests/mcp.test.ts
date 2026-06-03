@@ -17,6 +17,11 @@ import { sessionDir } from "../src/shared/paths.ts";
 import { readBlock } from "../src/shared/registry.ts";
 import { getBookmark } from "../src/shared/bookmarks.ts";
 import { projectSlugForDir } from "../src/proxy/jsonl.ts";
+import {
+  countTextTokens,
+  CONTENT_CALIBRATION,
+  SIGNATURE_CALIBRATION,
+} from "../src/shared/token-count.ts";
 
 let tempRoot: string;
 const TEST_SESSION = "test-mcp-session";
@@ -180,7 +185,10 @@ test("compress estimates original_tokens and defaults summary_tokens to 0 when o
     summary: "s",
   });
   const block = await readBlock(TEST_SESSION, 1);
-  assert.equal(block?.original_tokens, Math.ceil("content-msg_a".length / 4));
+  assert.equal(
+    block?.original_tokens,
+    Math.round(CONTENT_CALIBRATION * countTextTokens("content-msg_a")),
+  );
   assert.equal(block?.summary_tokens, 0);
   assert.equal(block?.focus, null);
 });
@@ -353,11 +361,64 @@ test("compress estimation includes thinking, tool_use, and tool_result content",
 
   assert.equal(result.isError, undefined);
   const payload = parseResult(result) as Record<string, unknown>;
-  const expectedChars =
-    "hello".length +
-    ["brainstorm", `Read\n${JSON.stringify(toolInput)}`].join("\n").length +
-    "file contents".length;
-  assert.equal(payload["original_tokens"], Math.ceil(expectedChars / 4));
+  // Reconstruct the expectation independently of the estimator: per message,
+  // tokenize the extracted text and apply the content calibration. The a1 block
+  // contributes its thinking text + tool_use (name + JSON input); u2 its
+  // tool_result text. None of these carry a signature. Spelling the content out
+  // (rather than reusing the estimator's own extractor) makes this a real guard.
+  const calcontent = (s: string) => Math.round(CONTENT_CALIBRATION * countTextTokens(s));
+  const expected =
+    calcontent("hello") +
+    calcontent(["brainstorm", `Read\n${JSON.stringify(toolInput)}`].join("\n")) +
+    calcontent("file contents");
+  assert.equal(payload["original_tokens"], expected);
+  // Guard the intent: the thinking + tool_use content must actually be counted,
+  // so the estimate exceeds the prose-only blocks (u1 + u2 text) alone.
+  const proseOnly = calcontent("hello") + calcontent("file contents");
+  assert.ok(
+    (payload["original_tokens"] as number) > proseOnly,
+    "estimate should include thinking and tool_use content",
+  );
+});
+
+test("compress estimation counts the calibrated fraction of thinking signatures", async () => {
+  const signature = "S".repeat(2000); // stand-in for a base64 thinking signature
+  await writeRawSessionJsonl(TEST_SESSION, [
+    {
+      type: "assistant",
+      uuid: "a1",
+      message: {
+        role: "assistant",
+        content: [
+          { type: "thinking", thinking: "reasoning", signature },
+          { type: "text", text: "answer" },
+        ],
+      },
+    },
+  ]);
+
+  const result = await handleCompress({
+    session_id: TEST_SESSION,
+    compressed_uuids: ["a1"],
+    summary: "s",
+  });
+
+  assert.equal(result.isError, undefined);
+  const payload = parseResult(result) as Record<string, unknown>;
+  // The signature is excluded from the visible content (messageContentToString)
+  // but billed at SIGNATURE_CALIBRATION of its tokenized length. Reconstruct
+  // both terms independently.
+  const contentTokens = countTextTokens(["reasoning", "answer"].join("\n"));
+  const signatureTokens = countTextTokens(signature);
+  const expected = Math.round(
+    CONTENT_CALIBRATION * contentTokens + SIGNATURE_CALIBRATION * signatureTokens,
+  );
+  assert.equal(payload["original_tokens"], expected);
+  // The signature term must be doing real work: dropping it would under-count.
+  assert.ok(
+    expected > Math.round(CONTENT_CALIBRATION * contentTokens),
+    "signature should contribute to the estimate",
+  );
 });
 
 test("compress falls back to CLAUDE_CODE_SESSION_ID env var when session_id omitted", async () => {

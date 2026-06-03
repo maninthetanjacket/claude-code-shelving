@@ -2,7 +2,7 @@
 
 Deliberate context-shelving for Claude Code. The model invokes a `compress` tool when work is settled enough to be summary-only; a proxy substitutes the registered summary for the original content on subsequent API requests; the session's source-of-truth JSONL stays untouched.
 
-**Status:** Stage 1 working end-to-end and validated against real CC sessions. 116 passing tests including E2E proxy + cache stability and regressions for harness-injected reminders, `tool_use` metadata drift, tool_use anchors embedded in larger multi-block messages, and tool-pair ID matching as a backstop when content bytes drift. The proxy injects `[turn N]` markers at the start of assistant responses so the model can address ranges by turn number; `compress` accepts UUID-list, phrase-pair, or turn-range selection. The canonical design document lives at `field-guide/shared-space/shelving-design.md` during development.
+**Status:** Stage 1 working end-to-end and validated against real CC sessions. 120 passing tests including E2E proxy + cache stability and regressions for harness-injected reminders, `tool_use` metadata drift, tool_use anchors embedded in larger multi-block messages, tool-pair ID matching as a backstop when content bytes drift, and calibrated token estimation. The proxy injects `[turn N]` markers at the start of assistant responses so the model can address ranges by turn number; `compress` accepts UUID-list, phrase-pair, or turn-range selection. The canonical design document lives at `field-guide/shared-space/shelving-design.md` during development.
 
 ## Architecture
 
@@ -151,7 +151,7 @@ Options:
 - `--context M` — expand each arc by up to M turns on each side (default: 1)
 - `--format text|json` — output format (default: text)
 
-Matching strategies, in preference order: exact phrase → all words within an arc → any word. Output includes first/last UUIDs, full UUID list, turn count, estimated tokens, and previews. For tool-only turns where text is unavailable, previews fall back to type tags like `[user · tool_result]`.
+Matching strategies, in preference order: exact phrase → all words within an arc → any word. Output includes first/last UUIDs, full UUID list, turn count, estimated tokens (calibrated — see [Token estimation](#token-estimation)), and previews. For tool-only turns where text is unavailable, previews fall back to type tags like `[user · tool_result]`.
 
 The model uses this to find candidate boundaries, then confirms them by inspecting context, then calls `compress`. Inspection-as-judgment stays with the model; inspection-as-mechanics is delegated.
 
@@ -205,7 +205,25 @@ With `preview_only: true`, the server returns the resolved turn range, matched a
 }
 ```
 
-All three modes return a `block_id`. On the next API request, the proxy substitutes the summary for the anchor message (first message of the range) and drops the rest. Token-count estimates (`original_tokens`, `summary_tokens`) are optional registry metadata; the server estimates `original_tokens` from JSONL content if omitted.
+All three modes return a `block_id`. On the next API request, the proxy substitutes the summary for the anchor message (first message of the range) and drops the rest. Token-count estimates (`original_tokens`, `summary_tokens`) are optional registry metadata; the server estimates `original_tokens` from JSONL content if omitted (see [Token estimation](#token-estimation)).
+
+### Token estimation
+
+`original_tokens` and `find-arc`'s `estimated_tokens` come from a calibrated estimator in `src/shared/token-count.ts`. The goal is to judge how much *Claude* context a range actually occupies.
+
+The base count uses a real BPE tokenizer (`gpt-tokenizer`, `o200k_base`) over the extracted content of every block — text, thinking, `tool_use` inputs, and `tool_result` bodies. This replaced a `chars / 4` heuristic, which ran ~2× low because shelving content is dominated by JSON, file paths, bash output, and hyphenated UUIDs that tokenize far denser than prose.
+
+A raw o200k count still isn't the target number. Calibrating o200k message tokens against real Anthropic `input_tokens` across ~60 captured requests (two-variable least squares, R² ≈ 0.94) yields a two-term **marginal** model:
+
+```
+freed_tokens(range) ≈ Σ_msgs [ 1.42 · o200k(content) + 0.28 · o200k(signature) ]
+```
+
+- **`CONTENT_CALIBRATION` (1.42)** — Claude's tokenizer is ~1.4× denser than o200k on this content mix (prose + code + JSON).
+- **`SIGNATURE_CALIBRATION` (0.28)** — extended-thinking blocks carry an encrypted `signature` (a large base64 blob, present in every replayed request). It is billed as input, but only ~28% of its tokenized length lands. The signature also tracks the *hidden* raw reasoning behind a turn (it scales with it, r ≈ 0.96), which is why it carries real input weight even though the visible thinking is only a summary.
+- The fixed prefix (system prompt + tool schemas, ~30K tokens in the measured config) is deliberately **excluded** — the estimate is marginal, and shelving conversation turns never reclaims the system/tools prefix.
+
+End-to-end the calibrated model predicts real `input_tokens` to within ~1% (median) on the captured traffic. The coefficients were fit on a single session and model: `1.42` (tokenizer density) should generalize; `0.28` (an Anthropic-internal billing/encoding artifact) may drift. Both are isolated, documented constants, easy to re-measure and retune.
 
 ### Decompressing
 
@@ -324,7 +342,7 @@ curl http://127.0.0.1:9802/health
 
 # 2. Run tests
 cd claude-code-shelving && npm test
-# Expected: 116 passing
+# Expected: 120 passing
 
 # 3. From inside a CC session with the MCP server registered, ask the model
 #    to call list_compressions. It should return an empty blocks array.
@@ -336,6 +354,7 @@ What's implemented:
 - `compress`, `decompress`, `recompress`, `list_compressions` MCP tools
 - `start_arc` / `compress_arc` MCP tools for bookmark-based range capture (label a starting point, do work, compress the labeled range without enumerating UUIDs)
 - `find-arc` CLI for assistive boundary discovery (mechanical search; model decides)
+- Calibrated token estimation (real BPE tokenizer over all block types, calibrated to Claude `input_tokens` with a content-density term and a thinking-signature term; see "Token estimation")
 - Range-based compress (model provides explicit UUID list)
 - Model-authored summaries (no proxy-side summarization)
 - Cache-stable proxy substitution

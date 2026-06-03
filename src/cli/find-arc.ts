@@ -21,6 +21,7 @@
 
 import { findSessionJsonl, parseSessionJsonl } from "../proxy/jsonl.js";
 import type { JsonlMessage } from "../proxy/transform.js";
+import { countContentTokens } from "../shared/token-count.js";
 
 interface Candidate {
   first_uuid: string;
@@ -180,11 +181,6 @@ function messagePreview(m: JsonlMessage, n = 80): string {
   return messageTag(m);
 }
 
-/** Rough token estimate: 4 chars per token. */
-function estimateTokens(text: string): number {
-  return Math.ceil(text.length / 4);
-}
-
 /** Truncate to N chars with ellipsis. */
 function preview(text: string, n = 80): string {
   const cleaned = text.replace(/\s+/g, " ").trim();
@@ -305,9 +301,9 @@ function buildCandidate(
 ): Candidate {
   const slice = messages.slice(arc.start, arc.end + 1);
   const uuids = slice.map((m) => m.uuid);
-  let totalChars = 0;
+  let estimatedTokens = 0;
   for (const m of slice) {
-    totalChars += messageText(m).length;
+    estimatedTokens += countContentTokens(m.content);
   }
   const first = slice[0]!;
   const last = slice[slice.length - 1]!;
@@ -317,7 +313,7 @@ function buildCandidate(
     last_uuid: last.uuid,
     uuids,
     turn_count: slice.length,
-    estimated_tokens: Math.ceil(totalChars / 4),
+    estimated_tokens: estimatedTokens,
     first_preview: messagePreview(first),
     last_preview: messagePreview(last),
     match_count: arc.hits.length,

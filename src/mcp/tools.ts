@@ -24,6 +24,10 @@ import {
 } from "./validate.js";
 import { loadSessionMessages } from "../proxy/jsonl.js";
 import type { JsonlMessage } from "../proxy/transform.js";
+import {
+  countContentTokens,
+  messageContentToString,
+} from "../shared/token-count.js";
 
 /**
  * Tool definitions and handlers for the shelving MCP server.
@@ -662,72 +666,13 @@ function estimateTokensForMessageIndexRange(
     return 0;
   }
 
-  let charCount = 0;
+  let tokenCount = 0;
   for (let i = firstMsgIdx; i <= lastMsgIdx; i++) {
     const msg = messages[i];
-    charCount += msg ? messageContentToString(msg.content).length : 0;
+    if (msg) tokenCount += countContentTokens(msg.content);
   }
 
-  return Math.ceil(charCount / 4);
-}
-
-function messageContentToString(content: string | unknown[]): string {
-  if (typeof content === "string") {
-    return content;
-  }
-  if (Array.isArray(content)) {
-    return content
-      .map(contentBlockToString)
-      .filter((item) => item.length > 0)
-      .join("\n");
-  }
-  return "";
-}
-
-function contentBlockToString(item: unknown): string {
-  if (typeof item === "string") return item;
-  if (!item || typeof item !== "object") return "";
-
-  const block = item as Record<string, unknown>;
-  if (typeof block["text"] === "string") {
-    return block["text"];
-  }
-
-  if (block["type"] === "thinking" && typeof block["thinking"] === "string") {
-    return block["thinking"];
-  }
-
-  if (block["type"] === "tool_use") {
-    const parts: string[] = [];
-    if (typeof block["name"] === "string") parts.push(block["name"]);
-    if (block["input"] !== undefined) parts.push(stableStringify(block["input"]));
-    return parts.join("\n");
-  }
-
-  if (block["type"] === "tool_result") {
-    const content = block["content"];
-    if (typeof content === "string") return content;
-    if (Array.isArray(content)) {
-      return content
-        .map(contentBlockToString)
-        .filter((part) => part.length > 0)
-        .join("\n");
-    }
-    if (content && typeof content === "object") {
-      return contentBlockToString(content);
-    }
-    return "";
-  }
-
-  return "";
-}
-
-function stableStringify(value: unknown): string {
-  try {
-    return JSON.stringify(value);
-  } catch {
-    return String(value);
-  }
+  return tokenCount;
 }
 
 async function validateCompressedRange(
