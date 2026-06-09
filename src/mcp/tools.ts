@@ -333,15 +333,16 @@ export async function handleCompress(args: unknown): Promise<ToolResult> {
   if (path === null) {
     return errorResult(`Session JSONL not found for session ${sessionId}`);
   }
+  const collapsedUuids = collapseConsecutiveDuplicates(messages.map((m) => m.uuid));
 
   let rangeUuids: string[];
   let startMatch: string | null;
   let endMatch: string | null;
   let estimatedTokens: number;
+  let closureInfo: RangeClosureInfo | null = null;
 
   if (hasTurns) {
     // Turn-based range selection (1-indexed, based on collapsed UUID stream)
-    const collapsedUuids = collapseConsecutiveDuplicates(messages.map((m) => m.uuid));
     const sIdx = startTurn! - 1;
     let eIdx = -1;
 
@@ -373,20 +374,18 @@ export async function handleCompress(args: unknown): Promise<ToolResult> {
       return errorResult(`end_turn ${endTurn ?? "latest user message"} is out of bounds or before start_turn`);
     }
 
-    rangeUuids = collapsedUuids.slice(sIdx, eIdx + 1);
+    const closedRange = closeRangeForToolPairs(messages, sIdx, eIdx);
+    closureInfo = closedRange.info;
+    rangeUuids = collapsedUuids.slice(closedRange.startPos, closedRange.endPos + 1);
     startMatch = `Turn ${sIdx + 1}`;
     endMatch = `Turn ${eIdx + 1}`;
 
-    const startUuid = collapsedUuids[sIdx];
-    const endUuid = collapsedUuids[eIdx];
-    const firstMsgIdx = messages.findIndex((m) => m.uuid === startUuid);
-    const lastMsgIdx = messages.findLastIndex((m: JsonlMessage) => m.uuid === endUuid);
-
-    estimatedTokens = estimateTokensForMessageIndexRange(
-      messages,
-      firstMsgIdx,
-      lastMsgIdx,
-    );
+    const startUuid = rangeUuids[0];
+    const endUuid = rangeUuids[rangeUuids.length - 1];
+    estimatedTokens =
+      startUuid !== undefined && endUuid !== undefined
+        ? estimateTokensForUuidRange(messages, startUuid, endUuid)
+        : 0;
 
     if (previewOnly) {
       const startUuid = rangeUuids[0];
@@ -403,8 +402,8 @@ export async function handleCompress(args: unknown): Promise<ToolResult> {
       return successResult({
         preview: true,
         session_id: sessionId,
-        start_turn: sIdx + 1,
-        end_turn: eIdx + 1,
+        start_turn: closedRange.startPos + 1,
+        end_turn: closedRange.endPos + 1,
         start_match: `Turn ${sIdx + 1}`,
         anchor_snippet: anchorSnippet,
         end_match: `Turn ${eIdx + 1}`,
@@ -412,6 +411,12 @@ export async function handleCompress(args: unknown): Promise<ToolResult> {
         turns: rangeUuids.length,
         estimated_tokens: estimatedTokens,
         range_uuids: rangeUuids,
+        ...(closureInfo === null
+          ? {}
+          : {
+              extended_turns: closureInfo.extendedTurns,
+              closure_note: closureInfo.note,
+            }),
         note: "Set preview_only=false with summary to perform compression",
       });
     }
@@ -426,45 +431,86 @@ export async function handleCompress(args: unknown): Promise<ToolResult> {
     if ("error" in result) {
       return errorResult(result.error);
     }
-    rangeUuids = result.uuids;
+    const closedRange = closeRangeForToolPairs(
+      messages,
+      result.startTurn - 1,
+      result.endTurn - 1,
+    );
+    closureInfo = closedRange.info;
+    rangeUuids = collapsedUuids.slice(closedRange.startPos, closedRange.endPos + 1);
     startMatch = result.startMatch;
     endMatch = result.endMatch;
-    estimatedTokens = result.estimatedTokens;
+    const startUuid = rangeUuids[0];
+    const endUuid = rangeUuids[rangeUuids.length - 1];
+    estimatedTokens =
+      startUuid !== undefined && endUuid !== undefined
+        ? estimateTokensForUuidRange(messages, startUuid, endUuid)
+        : 0;
 
     // Return preview if requested
     if (previewOnly) {
+      const anchorUuid = rangeUuids[0];
+      const endUuid = rangeUuids[rangeUuids.length - 1];
       return successResult({
         preview: true,
         session_id: sessionId,
         start_phrase: firstPhrase,
-        start_turn: result.startTurn,
-        end_turn: result.endTurn,
+        start_turn: closedRange.startPos + 1,
+        end_turn: closedRange.endPos + 1,
         start_match: startMatch,
-        anchor_snippet: result.anchorSnippet,
+        anchor_snippet:
+          anchorUuid !== undefined
+            ? previewSnippetForUuid(messages, anchorUuid, "start of selected range")
+            : "start of selected range",
         end_phrase: lastPhrase ?? "latest user message",
         end_match: endMatch,
-        end_snippet: result.endSnippet,
+        end_snippet:
+          endUuid !== undefined
+            ? previewSnippetForUuid(messages, endUuid, "end of selected range")
+            : "end of selected range",
         turns: rangeUuids.length,
         estimated_tokens: estimatedTokens,
         range_uuids: rangeUuids,
+        ...(closureInfo === null
+          ? {}
+          : {
+              extended_turns: closureInfo.extendedTurns,
+              closure_note: closureInfo.note,
+            }),
         note: "Pass confirm=true with summary to perform compression",
       });
     }
   } else {
     // UUID-based range selection (original behavior)
-    if (compressedUuids!.length === 0) {
+    const selectedCompressedUuids = compressedUuids;
+    if (selectedCompressedUuids === undefined || selectedCompressedUuids.length === 0) {
       return errorResult("compressed_uuids must contain at least one UUID");
     }
-    const validationError = await validateCompressedRange(sessionId, compressedUuids!);
+    const validationError = await validateCompressedRange(sessionId, selectedCompressedUuids);
     if (validationError !== null) {
       return errorResult(validationError);
     }
-    rangeUuids = compressedUuids!;
-    const firstUuid = compressedUuids![0];
-    const lastUuid = compressedUuids![compressedUuids!.length - 1];
+    const firstUuid = selectedCompressedUuids[0];
+    const lastUuid = selectedCompressedUuids[selectedCompressedUuids.length - 1];
+    if (firstUuid === undefined || lastUuid === undefined) {
+      return errorResult("compressed_uuids must contain at least one UUID");
+    }
+    const selectedRange = findRangePositions(collapsedUuids, firstUuid, lastUuid);
+    if (selectedRange === null) {
+      return errorResult("compressed_uuids could not be aligned to the session JSONL");
+    }
+    const closedRange = closeRangeForToolPairs(
+      messages,
+      selectedRange.startPos,
+      selectedRange.endPos,
+    );
+    closureInfo = closedRange.info;
+    rangeUuids = collapsedUuids.slice(closedRange.startPos, closedRange.endPos + 1);
+    const closedStartUuid = rangeUuids[0];
+    const closedEndUuid = rangeUuids[rangeUuids.length - 1];
     estimatedTokens =
-      firstUuid !== undefined && lastUuid !== undefined
-        ? estimateTokensForUuidRange(messages, firstUuid, lastUuid)
+      closedStartUuid !== undefined && closedEndUuid !== undefined
+        ? estimateTokensForUuidRange(messages, closedStartUuid, closedEndUuid)
         : 0;
     startMatch = null;
     endMatch = null;
@@ -525,14 +571,10 @@ function findRangeByPhrase(
   lastPhrase: string | undefined,
 ):
   | {
-      uuids: string[];
       startMatch: string;
       endMatch: string;
       startTurn: number;
       endTurn: number;
-      anchorSnippet: string;
-      endSnippet: string;
-      estimatedTokens: number;
     }
   | { error: string } {
   // Find first occurrence of firstPhrase (case-insensitive substring match)
@@ -616,22 +658,159 @@ function findRangeByPhrase(
     return { error: "Could not resolve contiguous range from phrase matches" };
   }
 
-  const uuids = expandedUuidStream.slice(startPos, endPos + 1);
-
-  const estimatedTokens = estimateTokensForUuidRange(messages, startUuid, endUuid);
-
   const endContent = messageContentToString(endMsg.content);
 
   return {
-    uuids,
     startMatch,
     endMatch: previewSnippet(endContent),
     startTurn: startPos + 1,
     endTurn: endPos + 1,
-    anchorSnippet: previewSnippet(messageContentToString(startMsg.content)),
-    endSnippet: previewSnippet(endContent),
-    estimatedTokens,
   };
+}
+
+type RangeClosureInfo = {
+  extendedTurns: number[];
+  note: string;
+};
+
+function closeRangeForToolPairs(
+  messages: JsonlMessage[],
+  startPos: number,
+  endPos: number,
+): { startPos: number; endPos: number; info: RangeClosureInfo | null } {
+  const toolPairs = collectToolPairPositions(messages);
+  let resolvedStart = startPos;
+  let resolvedEnd = endPos;
+
+  for (;;) {
+    let nextStart = resolvedStart;
+    let nextEnd = resolvedEnd;
+
+    for (const pair of toolPairs) {
+      const useInRange =
+        pair.toolUseTurn >= resolvedStart && pair.toolUseTurn <= resolvedEnd;
+      const resultInRange =
+        pair.toolResultTurn >= resolvedStart && pair.toolResultTurn <= resolvedEnd;
+      if (useInRange === resultInRange) continue;
+
+      if (pair.toolUseTurn < nextStart) nextStart = pair.toolUseTurn;
+      if (pair.toolResultTurn < nextStart) nextStart = pair.toolResultTurn;
+      if (pair.toolUseTurn > nextEnd) nextEnd = pair.toolUseTurn;
+      if (pair.toolResultTurn > nextEnd) nextEnd = pair.toolResultTurn;
+    }
+
+    if (nextStart === resolvedStart && nextEnd === resolvedEnd) {
+      break;
+    }
+    resolvedStart = nextStart;
+    resolvedEnd = nextEnd;
+  }
+
+  if (resolvedStart === startPos && resolvedEnd === endPos) {
+    return { startPos: resolvedStart, endPos: resolvedEnd, info: null };
+  }
+
+  const extendedTurns: number[] = [];
+  for (let turn = resolvedStart; turn < startPos; turn++) {
+    extendedTurns.push(turn + 1);
+  }
+  for (let turn = endPos + 1; turn <= resolvedEnd; turn++) {
+    extendedTurns.push(turn + 1);
+  }
+
+  const notes: string[] = [];
+  if (resolvedStart < startPos) {
+    notes.push("extended backward to include an earlier paired tool_use");
+  }
+  if (resolvedEnd > endPos) {
+    notes.push("extended forward to include a later paired tool_result");
+  }
+
+  return {
+    startPos: resolvedStart,
+    endPos: resolvedEnd,
+    info: {
+      extendedTurns,
+      note: `Range auto-extended to keep tool_use/tool_result pairs together: ${notes.join("; ")}.`,
+    },
+  };
+}
+
+function collectToolPairPositions(
+  messages: JsonlMessage[],
+): Array<{ toolUseTurn: number; toolResultTurn: number }> {
+  let turnPos = -1;
+  let previousUuid: string | null = null;
+  const toolUseTurns = new Map<string, number>();
+  const toolResultTurns = new Map<string, number>();
+
+  for (const message of messages) {
+    if (message.uuid !== previousUuid) {
+      turnPos += 1;
+      previousUuid = message.uuid;
+    }
+
+    for (const block of contentBlocks(message.content)) {
+      const toolUseId = toolUseBlockId(block);
+      if (toolUseId !== null && !toolUseTurns.has(toolUseId)) {
+        toolUseTurns.set(toolUseId, turnPos);
+      }
+
+      const toolResultId = toolResultBlockId(block);
+      if (toolResultId !== null && !toolResultTurns.has(toolResultId)) {
+        toolResultTurns.set(toolResultId, turnPos);
+      }
+    }
+  }
+
+  const pairs: Array<{ toolUseTurn: number; toolResultTurn: number }> = [];
+  for (const [toolId, toolUseTurn] of toolUseTurns) {
+    const toolResultTurn = toolResultTurns.get(toolId);
+    if (toolResultTurn !== undefined) {
+      pairs.push({ toolUseTurn, toolResultTurn });
+    }
+  }
+  return pairs;
+}
+
+function contentBlocks(content: string | unknown[]): unknown[] {
+  return Array.isArray(content) ? content : [];
+}
+
+function toolUseBlockId(block: unknown): string | null {
+  if (!block || typeof block !== "object") return null;
+  const record = block as Record<string, unknown>;
+  return record["type"] === "tool_use" && typeof record["id"] === "string"
+    ? record["id"]
+    : null;
+}
+
+function toolResultBlockId(block: unknown): string | null {
+  if (!block || typeof block !== "object") return null;
+  const record = block as Record<string, unknown>;
+  return record["type"] === "tool_result" && typeof record["tool_use_id"] === "string"
+    ? record["tool_use_id"]
+    : null;
+}
+
+function findRangePositions(
+  collapsedUuids: string[],
+  startUuid: string,
+  endUuid: string,
+): { startPos: number; endPos: number } | null {
+  const startPos = collapsedUuids.indexOf(startUuid);
+  let endPos = -1;
+  for (let i = collapsedUuids.length - 1; i >= 0; i--) {
+    if (collapsedUuids[i] === endUuid) {
+      endPos = i;
+      break;
+    }
+  }
+
+  if (startPos === -1 || endPos === -1 || startPos > endPos) {
+    return null;
+  }
+  return { startPos, endPos };
 }
 
 function previewSnippet(content: string): string {

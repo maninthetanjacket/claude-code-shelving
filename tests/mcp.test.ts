@@ -292,6 +292,115 @@ test("compress preview includes turn numbers and short boundary snippets", async
   assert.match(String(payload["end_snippet"]), /ending boundary message/);
 });
 
+test("compress phrase preview auto-extends to include a paired tool_result", async () => {
+  await writeRawSessionJsonl(TEST_SESSION, [
+    {
+      type: "user",
+      uuid: "u1",
+      message: {
+        role: "user",
+        content: "start boundary message",
+      },
+    },
+    {
+      type: "assistant",
+      uuid: "a1",
+      message: {
+        role: "assistant",
+        content: [
+          { type: "text", text: "running a command" },
+          { type: "tool_use", id: "toolu_pair", name: "Bash", input: { cmd: "echo pair me" } },
+        ],
+      },
+    },
+    {
+      type: "user",
+      uuid: "u2",
+      message: {
+        role: "user",
+        content: [
+          {
+            type: "tool_result",
+            tool_use_id: "toolu_pair",
+            content: "command output",
+          },
+        ],
+      },
+    },
+  ]);
+
+  const result = await handleCompress({
+    session_id: TEST_SESSION,
+    first_phrase: "start boundary",
+    last_phrase: "echo pair me",
+    preview_only: true,
+  });
+
+  assert.equal(result.isError, undefined);
+  const payload = parseResult(result) as Record<string, unknown>;
+  assert.equal(payload["preview"], true);
+  assert.equal(payload["start_turn"], 1);
+  assert.equal(payload["end_turn"], 3);
+  assert.deepEqual(payload["range_uuids"], ["u1", "a1", "u2"]);
+  assert.deepEqual(payload["extended_turns"], [3]);
+  assert.match(String(payload["closure_note"]), /tool_result/i);
+});
+
+test("compress phrase-based compression keeps tool_use and tool_result together", async () => {
+  await writeRawSessionJsonl(TEST_SESSION, [
+    {
+      type: "user",
+      uuid: "u1",
+      message: {
+        role: "user",
+        content: "start boundary message",
+      },
+    },
+    {
+      type: "assistant",
+      uuid: "a1",
+      message: {
+        role: "assistant",
+        content: [
+          { type: "text", text: "running a command" },
+          { type: "tool_use", id: "toolu_pair", name: "Bash", input: { cmd: "echo pair me" } },
+        ],
+      },
+    },
+    {
+      type: "user",
+      uuid: "u2",
+      message: {
+        role: "user",
+        content: [
+          {
+            type: "tool_result",
+            tool_use_id: "toolu_pair",
+            content: "command output",
+          },
+        ],
+      },
+    },
+  ]);
+
+  const result = await handleCompress({
+    session_id: TEST_SESSION,
+    first_phrase: "start boundary",
+    last_phrase: "echo pair me",
+    confirm: true,
+    summary: "paired tool exchange preserved",
+  });
+
+  assert.equal(result.isError, undefined);
+  const payload = parseResult(result) as Record<string, unknown>;
+  assert.equal(payload["compressed_count"], 3);
+  assert.equal(payload["anchor_uuid"], "u1");
+
+  const block = await readBlock(TEST_SESSION, payload["block_id"] as number);
+  assert.notEqual(block, null);
+  assert.deepEqual(block?.compressed_uuids, ["u1", "a1", "u2"]);
+});
+
 test("compress turn preview returns preview payload and does not create a block", async () => {
   await writeSimpleSessionJsonl(TEST_SESSION, ["u1", "a1", "u2", "a2", "u3"]);
 
@@ -314,6 +423,119 @@ test("compress turn preview returns preview payload and does not create a block"
 
   const block = await readBlock(TEST_SESSION, 1);
   assert.equal(block, null);
+});
+
+test("compress turn preview extends backward when the selected start is a tool_result", async () => {
+  await writeRawSessionJsonl(TEST_SESSION, [
+    {
+      type: "user",
+      uuid: "u1",
+      message: {
+        role: "user",
+        content: "before tool exchange",
+      },
+    },
+    {
+      type: "assistant",
+      uuid: "a1",
+      message: {
+        role: "assistant",
+        content: [
+          { type: "tool_use", id: "toolu_pair", name: "Bash", input: { cmd: "pwd" } },
+        ],
+      },
+    },
+    {
+      type: "user",
+      uuid: "u2",
+      message: {
+        role: "user",
+        content: [
+          {
+            type: "tool_result",
+            tool_use_id: "toolu_pair",
+            content: "command output",
+          },
+        ],
+      },
+    },
+    {
+      type: "assistant",
+      uuid: "a2",
+      message: {
+        role: "assistant",
+        content: "after tool exchange",
+      },
+    },
+  ]);
+
+  const result = await handleCompress({
+    session_id: TEST_SESSION,
+    start_turn: 3,
+    end_turn: 4,
+    preview_only: true,
+    summary: "placeholder summary",
+  });
+
+  assert.equal(result.isError, undefined);
+  const payload = parseResult(result) as Record<string, unknown>;
+  assert.equal(payload["start_turn"], 2);
+  assert.equal(payload["end_turn"], 4);
+  assert.deepEqual(payload["range_uuids"], ["a1", "u2", "a2"]);
+  assert.deepEqual(payload["extended_turns"], [2]);
+  assert.match(String(payload["closure_note"]), /tool_use/i);
+});
+
+test("compress UUID selection extends backward to include a paired tool_use", async () => {
+  await writeRawSessionJsonl(TEST_SESSION, [
+    {
+      type: "assistant",
+      uuid: "a1",
+      message: {
+        role: "assistant",
+        content: [
+          { type: "tool_use", id: "toolu_pair", name: "Bash", input: { cmd: "pwd" } },
+        ],
+      },
+    },
+    {
+      type: "user",
+      uuid: "u1",
+      message: {
+        role: "user",
+        content: [
+          {
+            type: "tool_result",
+            tool_use_id: "toolu_pair",
+            content: "command output",
+          },
+        ],
+      },
+    },
+    {
+      type: "assistant",
+      uuid: "a2",
+      message: {
+        role: "assistant",
+        content: "after tool exchange",
+      },
+    },
+  ]);
+
+  const result = await handleCompress({
+    session_id: TEST_SESSION,
+    compressed_uuids: ["u1", "a2"],
+    summary: "paired tool exchange preserved",
+  });
+
+  assert.equal(result.isError, undefined);
+  const payload = parseResult(result) as Record<string, unknown>;
+  assert.equal(payload["compressed_count"], 3);
+  assert.equal(payload["anchor_uuid"], "a1");
+
+  const block = await readBlock(TEST_SESSION, payload["block_id"] as number);
+  assert.notEqual(block, null);
+  assert.deepEqual(block?.compressed_uuids, ["a1", "u1", "a2"]);
 });
 
 test("compress estimation includes thinking, tool_use, and tool_result content", async () => {

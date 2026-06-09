@@ -180,7 +180,7 @@ The `compress` tool accepts three interchangeable ways to specify the range. Pic
 }
 ```
 
-With `preview_only: true`, the server returns the resolved turn range, matched anchor/end snippets, turn count, estimated tokens, and the full UUID list — without compressing. Inspect, then re-call with `confirm: true` (and `preview_only` removed or false) to perform the compression. `last_phrase` is optional; if omitted, the range extends from `first_phrase` to the latest user message in the JSONL.
+With `preview_only: true`, the server returns the resolved turn range, matched anchor/end snippets, turn count, estimated tokens, and the full UUID list — without compressing. Inspect, then re-call with `confirm: true` (and `preview_only` removed or false) to perform the compression. If pair-closure widens the resolved range to keep a `tool_use` and its `tool_result` together, preview payloads also include `extended_turns` and `closure_note` so the model can see the adjustment before confirming. `last_phrase` is optional; if omitted, the range extends from `first_phrase` to the latest user message in the JSONL.
 
 **Turn-range selection.** Address the range by turn numbers. The proxy injects `[turn N]\n\n` at the start of each assistant response, so the model can see its own turn numbers in flight.
 
@@ -205,7 +205,7 @@ With `preview_only: true`, the server returns the resolved turn range, matched a
 }
 ```
 
-All three modes return a `block_id`. On the next API request, the proxy substitutes the summary for the anchor message (first message of the range) and drops the rest. Token-count estimates (`original_tokens`, `summary_tokens`) are optional registry metadata; the server estimates `original_tokens` from JSONL content if omitted (see [Token estimation](#token-estimation)).
+All three modes run a pair-closure pass after resolving the candidate range. If the range includes a `tool_use`, its paired `tool_result` is pulled in too; if the range would begin on a `tool_result`, the range extends backward to include the earlier `tool_use` rather than trimming the selected start away. This keeps tool exchanges structurally closed before compression. All three modes return a `block_id`. On the next API request, the proxy substitutes the summary for the anchor message (first message of the resolved range) and drops the rest. Token-count estimates (`original_tokens`, `summary_tokens`) are optional registry metadata; the server estimates `original_tokens` from JSONL content if omitted (see [Token estimation](#token-estimation)).
 
 ### Token estimation
 

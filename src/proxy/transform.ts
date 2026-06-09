@@ -57,7 +57,7 @@ import type { Block } from "../shared/types.js";
  * (text, tool_use, tool_result, image, etc).
  */
 export interface ApiMessage {
-  role: "user" | "assistant";
+  role: "user" | "assistant" | "system";
   content: string | unknown[];
 }
 
@@ -273,41 +273,37 @@ export function applySubstitutions(
  * have no JSONL UUID and therefore pass through the matcher untouched. Two
  * invalid shapes result, both of which the API rejects:
  *
- *  1. Orphaned system reminders. A reminder is only valid immediately before an
- *     assistant turn (or at the end of the array). When the assistant turn it
- *     preceded is dropped, the reminder is left in front of a `user` message and
- *     the API returns: "role 'system' must precede an 'assistant' message or end
- *     the array."
+ *  1. Orphaned / misplaced system reminders. A reminder is only valid when it
+ *     still sits between a permitted predecessor (a `user` turn, or an
+ *     `assistant` turn ending in a `server_tool_result`) and a permitted
+ *     successor (`assistant` or end-of-array). Compression can strand the
+ *     reminder after the wrong turn or in front of a `user` turn, and the API
+ *     rejects the request.
  *
  *  2. Same-role adjacency. Collapsing a range whose anchor is a user message and
  *     whose following message is also a user message leaves two user turns back
  *     to back once the assistant turns between them are gone.
  *
- * This pass fixes both: it drops system reminders that no longer precede an
- * assistant message (or end the array), then merges any consecutive same-role
+ * This pass fixes both: it drops system reminders that no longer have a valid
+ * predecessor/successor placement, then merges any consecutive same-role
  * user/assistant messages. It is a no-op on an already-valid sequence, so it
  * leaves untouched passthrough requests byte-identical.
  */
 function normalizeMessageSequence(messages: ApiMessage[]): ApiMessage[] {
-  // 1. Prune orphaned system reminders.
+  // 1. Prune orphaned / misplaced system reminders.
   const pruned: ApiMessage[] = [];
   for (let i = 0; i < messages.length; i++) {
     const message = messages[i];
     if (message === undefined) continue;
-    if ((message.role as string) === "system") {
-      let j = i + 1;
-      while (j < messages.length && (messages[j]?.role as string) === "system") {
-        j++;
-      }
-      const next = messages[j];
-      // Keep only if the run is terminated by an assistant turn or by the end
-      // of the array; otherwise the reminder is orphaned and must be dropped.
-      if (next === undefined || next.role === "assistant") {
-        pruned.push(message);
+    if (message.role === "system") {
+      const previous = findPreviousNonSystem(pruned);
+      const next = findNextNonSystem(messages, i + 1);
+      if (hasValidSystemPredecessor(previous) && hasValidSystemSuccessor(next)) {
+        pruned.push({ ...message });
       }
       continue;
     }
-    pruned.push(message);
+    pruned.push({ ...message });
   }
 
   // 2. Merge consecutive same-role user/assistant messages.
@@ -326,6 +322,50 @@ function normalizeMessageSequence(messages: ApiMessage[]): ApiMessage[] {
     }
   }
   return merged;
+}
+
+function findPreviousNonSystem(messages: ApiMessage[]): ApiMessage | undefined {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const message = messages[i];
+    if (message !== undefined && message.role !== "system") {
+      return message;
+    }
+  }
+  return undefined;
+}
+
+function findNextNonSystem(
+  messages: ApiMessage[],
+  startIndex: number,
+): ApiMessage | undefined {
+  for (let i = startIndex; i < messages.length; i++) {
+    const message = messages[i];
+    if (message !== undefined && message.role !== "system") {
+      return message;
+    }
+  }
+  return undefined;
+}
+
+function hasValidSystemPredecessor(message: ApiMessage | undefined): boolean {
+  if (message === undefined) return false;
+  if (message.role === "user") return true;
+  return message.role === "assistant" && messageEndsInServerToolResult(message);
+}
+
+function hasValidSystemSuccessor(message: ApiMessage | undefined): boolean {
+  return message === undefined || message.role === "assistant";
+}
+
+function messageEndsInServerToolResult(message: ApiMessage): boolean {
+  if (!Array.isArray(message.content) || message.content.length === 0) {
+    return false;
+  }
+  const lastBlock = message.content[message.content.length - 1];
+  if (typeof lastBlock !== "object" || lastBlock === null) {
+    return false;
+  }
+  return (lastBlock as Record<string, unknown>)["type"] === "server_tool_result";
 }
 
 function mergeContents(
@@ -426,7 +466,7 @@ function resolveMessageMatch(
 }
 
 function directToolPairUuidsForBlock(
-  role: "user" | "assistant",
+  role: "user" | "assistant" | "system",
   block: unknown,
   toolUseIdToUuids: Map<string, string[]>,
   toolResultIdToUuids: Map<string, string[]>,

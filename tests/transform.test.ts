@@ -960,3 +960,36 @@ test("a system reminder that still precedes an assistant is preserved", () => {
   assert.equal(msgs[sysIdx + 1]?.role, "assistant");
   assert.equal(msgs[sysIdx]?.content, "live reminder");
 });
+
+test("a system reminder after an assistant summary is pruned unless that assistant ends in server_tool_result", () => {
+  const request = makeRequest([
+    { role: "assistant", content: "anchor" }, // anchor
+    { role: "user", content: "drop me" }, // drop
+    sys("task reminder"), // invalid after assistant summary
+    { role: "assistant", content: "real reply" }, // survives
+  ]);
+
+  const jsonl = makeJsonl([
+    ["u1", "assistant", "anchor"],
+    ["u2", "user", "drop me"],
+    ["u3", "assistant", "real reply"],
+  ]);
+
+  const block = makeBlock({
+    anchor_uuid: "u1",
+    compressed_uuids: ["u1", "u2"],
+    summary: "Collapsed.",
+  });
+
+  const result = applySubstitutions(request, jsonl, [block]);
+  const msgs = result.request.messages;
+
+  assert.equal(
+    msgs.some((m) => (m.role as string) === "system"),
+    false,
+    "system reminder should be dropped after assistant summary text",
+  );
+  assert.deepEqual(msgs.map((m) => m.role), ["assistant"]);
+  assert.match(JSON.stringify(msgs[0]?.content), /Collapsed\./);
+  assert.match(JSON.stringify(msgs[0]?.content), /real reply/);
+});
