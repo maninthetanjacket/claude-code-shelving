@@ -74,6 +74,7 @@ export interface JsonlMessage {
   uuid: string;
   role: "user" | "assistant";
   content: string | unknown[];
+  parent_uuid?: string;
 }
 
 export interface TransformResult {
@@ -129,6 +130,8 @@ export function applySubstitutions(
     };
   }
 
+  const expandedBlocks = expandBlocksForChildMedia(activeBlocks, jsonlMessages);
+
   // Build exact content-key → uuid map from the JSONL, plus a fragment index
   // for cases where CC combines multiple logical messages into one API message
   // or adds transport-only blocks like assistant thinking.
@@ -154,7 +157,7 @@ export function applySubstitutions(
   // role_in_block: "anchor" or "drop".
   type Role = "anchor" | "drop";
   const uuidToBlock = new Map<string, { block: Block; role: Role }>();
-  for (const block of activeBlocks) {
+  for (const block of expandedBlocks) {
     for (let i = 0; i < block.compressed_uuids.length; i++) {
       const uuid = block.compressed_uuids[i];
       if (uuid === undefined) continue;
@@ -275,7 +278,7 @@ export function applySubstitutions(
   }
 
   const blocksAppliedList = Array.from(blocksApplied).sort((a, b) => a - b);
-  const blocksInactive = activeBlocks
+  const blocksInactive = expandedBlocks
     .map((b) => b.block_id)
     .filter((id) => !blocksApplied.has(id))
     .sort((a, b) => a - b);
@@ -287,6 +290,128 @@ export function applySubstitutions(
     blocks_applied: blocksAppliedList,
     blocks_inactive_in_request: blocksInactive,
   };
+}
+
+function expandBlocksForChildMedia(
+  activeBlocks: Block[],
+  jsonlMessages: JsonlMessage[],
+): Block[] {
+  const turns = collectCollapsedTurnsMetadata(jsonlMessages);
+  if (turns.length === 0) return activeBlocks;
+  return activeBlocks.map((block) => expandBlockForChildMedia(block, turns));
+}
+
+type CollapsedTurnMetadata = {
+  uuid: string;
+  role: "user" | "assistant";
+  parentUuid: string | null;
+  messages: JsonlMessage[];
+};
+
+function collectCollapsedTurnsMetadata(messages: JsonlMessage[]): CollapsedTurnMetadata[] {
+  const turns: CollapsedTurnMetadata[] = [];
+  let current: CollapsedTurnMetadata | null = null;
+
+  for (const message of messages) {
+    if (current === null || current.uuid !== message.uuid) {
+      current = {
+        uuid: message.uuid,
+        role: message.role,
+        parentUuid: message.parent_uuid ?? null,
+        messages: [message],
+      };
+      turns.push(current);
+      continue;
+    }
+
+    if (current.parentUuid === null && typeof message.parent_uuid === "string") {
+      current.parentUuid = message.parent_uuid;
+    }
+    current.messages.push(message);
+  }
+
+  return turns;
+}
+
+function expandBlockForChildMedia(block: Block, turns: CollapsedTurnMetadata[]): Block {
+  const expandedUuids = [...block.compressed_uuids];
+  const covered = new Set(expandedUuids);
+  let endPos = -1;
+
+  for (let i = 0; i < turns.length; i++) {
+    const turn = turns[i];
+    if (turn !== undefined && turn.uuid === expandedUuids[expandedUuids.length - 1]) {
+      endPos = i;
+      break;
+    }
+  }
+  if (endPos === -1) return block;
+
+  for (;;) {
+    const nextTurn = turns[endPos + 1];
+    if (nextTurn === undefined) break;
+    if (!isMediaOnlyChildTurn(nextTurn, turns, covered)) break;
+    expandedUuids.push(nextTurn.uuid);
+    covered.add(nextTurn.uuid);
+    endPos += 1;
+  }
+
+  if (expandedUuids.length === block.compressed_uuids.length) {
+    return block;
+  }
+
+  return {
+    ...block,
+    compressed_uuids: expandedUuids,
+  };
+}
+
+function isMediaOnlyChildTurn(
+  turn: CollapsedTurnMetadata,
+  turns: CollapsedTurnMetadata[],
+  covered: Set<string>,
+): boolean {
+  if (turn.role !== "user" || turn.parentUuid === null) return false;
+  if (!turnContainsOnlyMedia(turn.messages)) return false;
+
+  const parentTurn = turns.find((candidate) => candidate.uuid === turn.parentUuid);
+  if (parentTurn === undefined || !covered.has(parentTurn.uuid)) return false;
+
+  return turnContainsToolResult(parentTurn.messages) || turnContainsOnlyMedia(parentTurn.messages);
+}
+
+function turnContainsOnlyMedia(messages: JsonlMessage[]): boolean {
+  let sawBlock = false;
+
+  for (const message of messages) {
+    if (!Array.isArray(message.content)) return false;
+    for (const block of message.content) {
+      if (typeof block !== "object" || block === null) return false;
+      const type = (block as Record<string, unknown>)["type"];
+      if (type !== "image" && type !== "document") {
+        return false;
+      }
+      sawBlock = true;
+    }
+  }
+
+  return sawBlock;
+}
+
+function turnContainsToolResult(messages: JsonlMessage[]): boolean {
+  for (const message of messages) {
+    if (!Array.isArray(message.content)) continue;
+    for (const block of message.content) {
+      if (
+        typeof block === "object" &&
+        block !== null &&
+        (block as Record<string, unknown>)["type"] === "tool_result"
+      ) {
+        return true;
+      }
+    }
+  }
+  return false;
 }
 
 /**

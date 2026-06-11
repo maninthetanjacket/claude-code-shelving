@@ -123,13 +123,14 @@ export async function parseSessionJsonl(path: string): Promise<JsonlMessage[]> {
     }
     if (typeof entry !== "object" || entry === null) continue;
     const e = entry as Record<string, unknown>;
+    const parentUuid = typeof e["parentUuid"] === "string" ? e["parentUuid"] : undefined;
 
     const type = e["type"];
     const uuid = e["uuid"];
     if (typeof uuid !== "string" || uuid.length === 0) continue;
 
     if (type === "attachment") {
-      messages.push(...parseAttachmentEntry(e, uuid));
+      messages.push(...parseAttachmentEntry(e, uuid, parentUuid));
       continue;
     }
 
@@ -145,7 +146,7 @@ export async function parseSessionJsonl(path: string): Promise<JsonlMessage[]> {
     const content = msg["content"];
     if (typeof content !== "string" && !Array.isArray(content)) continue;
 
-    messages.push({ uuid, role, content });
+    messages.push({ uuid, role, content, parent_uuid: parentUuid });
   }
 
   return messages;
@@ -154,6 +155,7 @@ export async function parseSessionJsonl(path: string): Promise<JsonlMessage[]> {
 function parseAttachmentEntry(
   entry: Record<string, unknown>,
   uuid: string,
+  parentUuid: string | undefined,
 ): JsonlMessage[] {
   const attachment = entry["attachment"];
   if (typeof attachment !== "object" || attachment === null) return [];
@@ -190,6 +192,7 @@ function parseAttachmentEntry(
     {
       uuid,
       role: "user",
+      parent_uuid: parentUuid,
       content:
         `<system-reminder>\n` +
         `Called the Read tool with the following input: ` +
@@ -199,6 +202,7 @@ function parseAttachmentEntry(
     {
       uuid,
       role: "user",
+      parent_uuid: parentUuid,
       content: [
         {
           type: "text",

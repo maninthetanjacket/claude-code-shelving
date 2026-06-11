@@ -964,6 +964,83 @@ test("mixed user message drops merged image fragments that belong to shelved tur
   assert.doesNotMatch(JSON.stringify(msgs[0]?.content), /"image"/);
 });
 
+test("legacy block that only captured a Read tool pair still drops child image turns", () => {
+  const imageA = {
+    type: "image",
+    source: { type: "base64", media_type: "image/jpeg", data: "aaa" },
+  };
+  const imageB = {
+    type: "image",
+    source: { type: "base64", media_type: "image/jpeg", data: "bbb" },
+  };
+
+  const request = makeRequest([
+    {
+      role: "assistant",
+      content: [
+        { type: "tool_use", id: "toolu_pdf", name: "Read", input: { file_path: "/tmp/book.pdf" } },
+      ],
+    },
+    {
+      role: "user",
+      content: [
+        {
+          type: "tool_result",
+          tool_use_id: "toolu_pdf",
+          content: "PDF pages extracted: 2 page(s)",
+          is_error: false,
+        },
+      ],
+    },
+    {
+      role: "user",
+      content: [imageA, imageB],
+    },
+  ]);
+
+  const jsonl: JsonlMessage[] = [
+    {
+      uuid: "u1",
+      role: "assistant",
+      content: [
+        { type: "tool_use", id: "toolu_pdf", name: "Read", input: { file_path: "/tmp/book.pdf" } },
+      ],
+    },
+    {
+      uuid: "u2",
+      role: "user",
+      parent_uuid: "u1",
+      content: [
+        {
+          type: "tool_result",
+          tool_use_id: "toolu_pdf",
+          content: "PDF pages extracted: 2 page(s)",
+          is_error: false,
+        },
+      ],
+    },
+    {
+      uuid: "u3",
+      role: "user",
+      parent_uuid: "u2",
+      content: [imageA, imageB],
+    },
+  ];
+
+  const block = makeBlock({
+    anchor_uuid: "u1",
+    compressed_uuids: ["u1", "u2"],
+    summary: "Collapsed PDF read exchange.",
+  });
+
+  const result = applySubstitutions(request, jsonl, [block]);
+  const msgs = result.request.messages;
+
+  assert.deepEqual(msgs.map((m) => m.role), ["assistant"]);
+  assert.match(JSON.stringify(msgs[0]?.content), /Collapsed PDF read exchange\./);
+  assert.doesNotMatch(JSON.stringify(msgs[0]?.content), /"image"/);
+});
+
 test("mixed user message drops merged document fragments that belong to shelved turns", () => {
   const documentA = {
     type: "document",

@@ -860,6 +860,83 @@ test("compress accepts a contiguous range that includes an attachment UUID once"
   assert.equal(payload["compressed_count"], 3);
 });
 
+test("compress auto-extends a selected Read tool pair to include its child image turn", async () => {
+  await writeRawSessionJsonl(TEST_SESSION, [
+    {
+      type: "assistant",
+      uuid: "u_tool",
+      message: {
+        role: "assistant",
+        content: [
+          {
+            type: "tool_use",
+            id: "toolu_pdf",
+            name: "Read",
+            input: { file_path: "/tmp/book.pdf", pages: "10-11" },
+          },
+        ],
+      },
+    },
+    {
+      type: "user",
+      uuid: "u_result",
+      parentUuid: "u_tool",
+      message: {
+        role: "user",
+        content: [
+          {
+            type: "tool_result",
+            tool_use_id: "toolu_pdf",
+            content: "PDF pages extracted: 2 page(s) from /tmp/book.pdf",
+            is_error: false,
+          },
+        ],
+      },
+    },
+    {
+      type: "user",
+      uuid: "u_images",
+      parentUuid: "u_result",
+      message: {
+        role: "user",
+        content: [
+          {
+            type: "image",
+            source: { type: "base64", media_type: "image/jpeg", data: "aaa" },
+          },
+          {
+            type: "image",
+            source: { type: "base64", media_type: "image/jpeg", data: "bbb" },
+          },
+        ],
+      },
+    },
+    {
+      type: "assistant",
+      uuid: "u_after",
+      parentUuid: "u_images",
+      message: {
+        role: "assistant",
+        content: "Reflection after reading",
+      },
+    },
+  ]);
+
+  const result = await handleCompress({
+    session_id: TEST_SESSION,
+    compressed_uuids: ["u_tool"],
+    summary: "s",
+  });
+
+  assert.equal(result.isError, undefined);
+  const payload = parseResult(result) as Record<string, unknown>;
+  assert.equal(payload["compressed_count"], 3);
+
+  const block = await readBlock(TEST_SESSION, 1);
+  assert.notEqual(block, null);
+  assert.deepEqual(block?.compressed_uuids, ["u_tool", "u_result", "u_images"]);
+});
+
 // ---------------------------------------------------------------------------
 // place
 // ---------------------------------------------------------------------------

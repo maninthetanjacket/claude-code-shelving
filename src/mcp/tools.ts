@@ -1023,6 +1023,20 @@ function closeRangeForToolPairs(
     resolvedEnd = nextEnd;
   }
 
+  const notes: string[] = [];
+  if (resolvedStart < startPos) {
+    notes.push("extended backward to include an earlier paired tool_use");
+  }
+  if (resolvedEnd > endPos) {
+    notes.push("extended forward to include a later paired tool_result");
+  }
+
+  const mediaExtension = extendRangeForChildMedia(messages, resolvedStart, resolvedEnd);
+  resolvedEnd = mediaExtension.endPos;
+  if (mediaExtension.info !== null) {
+    notes.push(mediaExtension.info.note);
+  }
+
   if (resolvedStart === startPos && resolvedEnd === endPos) {
     return { startPos: resolvedStart, endPos: resolvedEnd, info: null };
   }
@@ -1035,22 +1049,115 @@ function closeRangeForToolPairs(
     extendedTurns.push(turn + 1);
   }
 
-  const notes: string[] = [];
-  if (resolvedStart < startPos) {
-    notes.push("extended backward to include an earlier paired tool_use");
-  }
-  if (resolvedEnd > endPos) {
-    notes.push("extended forward to include a later paired tool_result");
-  }
-
   return {
     startPos: resolvedStart,
     endPos: resolvedEnd,
     info: {
       extendedTurns,
-      note: `Range auto-extended to keep tool_use/tool_result pairs together: ${notes.join("; ")}.`,
+      note: `Range auto-extended to keep related message fragments together: ${notes.join("; ")}.`,
     },
   };
+}
+
+function extendRangeForChildMedia(
+  messages: JsonlMessage[],
+  startPos: number,
+  endPos: number,
+): { endPos: number; info: RangeClosureInfo | null } {
+  const turns = collectCollapsedTurnsMetadata(messages);
+  let resolvedEnd = endPos;
+
+  for (;;) {
+    const nextTurn = turns[resolvedEnd + 1];
+    if (nextTurn === undefined) break;
+    if (!isMediaOnlyChildTurn(nextTurn, turns, startPos, resolvedEnd)) break;
+    resolvedEnd += 1;
+  }
+
+  if (resolvedEnd === endPos) {
+    return { endPos: resolvedEnd, info: null };
+  }
+
+  const extendedTurns: number[] = [];
+  for (let turn = endPos + 1; turn <= resolvedEnd; turn++) {
+    extendedTurns.push(turn + 1);
+  }
+
+  return {
+    endPos: resolvedEnd,
+    info: {
+      extendedTurns,
+      note: "extended forward to include a child media turn attached to the selected tool result",
+    },
+  };
+}
+
+type CollapsedTurnMetadata = {
+  uuid: string;
+  role: "user" | "assistant";
+  parentUuid: string | null;
+  messages: JsonlMessage[];
+};
+
+function collectCollapsedTurnsMetadata(messages: JsonlMessage[]): CollapsedTurnMetadata[] {
+  const turns: CollapsedTurnMetadata[] = [];
+  let current: CollapsedTurnMetadata | null = null;
+
+  for (const message of messages) {
+    if (current === null || current.uuid !== message.uuid) {
+      current = {
+        uuid: message.uuid,
+        role: message.role,
+        parentUuid: message.parent_uuid ?? null,
+        messages: [message],
+      };
+      turns.push(current);
+      continue;
+    }
+
+    if (current.parentUuid === null && typeof message.parent_uuid === "string") {
+      current.parentUuid = message.parent_uuid;
+    }
+    current.messages.push(message);
+  }
+
+  return turns;
+}
+
+function isMediaOnlyChildTurn(
+  turn: CollapsedTurnMetadata,
+  turns: CollapsedTurnMetadata[],
+  startPos: number,
+  endPos: number,
+): boolean {
+  if (turn.role !== "user" || turn.parentUuid === null) return false;
+  if (!turnContainsOnlyMedia(turn.messages)) return false;
+
+  for (let i = startPos; i <= endPos; i++) {
+    const candidate = turns[i];
+    if (candidate !== undefined && candidate.uuid === turn.parentUuid) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function turnContainsOnlyMedia(messages: JsonlMessage[]): boolean {
+  let sawBlock = false;
+
+  for (const message of messages) {
+    if (!Array.isArray(message.content)) return false;
+    for (const block of message.content) {
+      if (typeof block !== "object" || block === null) return false;
+      const type = (block as Record<string, unknown>)["type"];
+      if (type !== "image" && type !== "document") {
+        return false;
+      }
+      sawBlock = true;
+    }
+  }
+
+  return sawBlock;
 }
 
 function collectToolPairPositions(
