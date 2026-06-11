@@ -38,10 +38,12 @@ import type { Block } from "../shared/types.js";
  * substitute at the anchor position. The filter ensures all-or-nothing
  * application per block per request.
  *
- * Fragment substitution: when an anchor is a fragment inside a larger
- * assistant message (typical case: tool_use embedded with thinking and
- * text), `rewriteEmbeddedAnchorContent` substitutes just that fragment in
- * place. Surrounding thinking and text are preserved.
+ * Fragment substitution: when a compressed UUID is only one fragment inside a
+ * larger API message, `rewriteEmbeddedBlockContent` rewrites just those
+ * fragments in place. Anchor fragments become the summary; drop fragments are
+ * omitted; unrelated fragments are preserved. This prevents mixed user turns
+ * (for example: live tool_result + newly typed follow-up text) from losing the
+ * live tool_result when only the follow-up text belongs to a compressed block.
  *
  * Both sides go through `normalizeContent` before matching. See the comment
  * on that function for the canonicalization invariants — the matcher is
@@ -230,7 +232,7 @@ export function applySubstitutions(
 
     blocksApplied.add(block.block_id);
     if (containsAnchor) {
-      const rewrittenContent = rewriteEmbeddedAnchorContent(
+      const rewrittenContent = rewriteEmbeddedBlockContent(
         apiMsg,
         block,
         resolved,
@@ -245,8 +247,30 @@ export function applySubstitutions(
       });
       anchorsSubstituted++;
     } else {
-      // Drop this message entirely.
-      messagesDropped++;
+      const rewrittenContent = rewriteEmbeddedBlockContent(
+        apiMsg,
+        block,
+        resolved,
+        uuidToBlock,
+      );
+      if (rewrittenContent === null) {
+        // Drop this message entirely.
+        messagesDropped++;
+        continue;
+      }
+
+      if (
+        Array.isArray(rewrittenContent) &&
+        rewrittenContent.length === 0
+      ) {
+        messagesDropped++;
+        continue;
+      }
+
+      newMessages.push({
+        role: apiMsg.role,
+        content: rewrittenContent,
+      });
     }
   }
 
@@ -405,16 +429,32 @@ function fragmentKeys(role: string, content: string | unknown[]): string[] {
   }
   const keys: string[] = [];
   for (const block of normalized) {
-    const key = fragmentKeyForBlock(role, block);
-    if (key !== null) keys.push(key);
+    collectFragmentKeys(role, block, keys);
   }
   return keys;
+}
+
+function collectFragmentKeys(role: string, block: unknown, keys: string[]): void {
+  const key = fragmentKeyForBlock(role, block);
+  if (key !== null) keys.push(key);
+
+  const nested = nestedToolResultContent(block);
+  if (nested === null) return;
+  for (const item of nested) {
+    collectFragmentKeys(role, item, keys);
+  }
 }
 
 interface ResolvedMessageMatch {
   matchedUuids: string[];
   exactUuid: string | null;
-  fragmentMatches: string[][];
+  fragmentMatches: ResolvedBlockMatch[];
+}
+
+interface ResolvedBlockMatch {
+  matchedUuids: string[];
+  directMatchedUuids: string[];
+  nestedMatches: ResolvedBlockMatch[];
 }
 
 function resolveMessageMatch(
@@ -430,7 +470,11 @@ function resolveMessageMatch(
       matchedUuids: [exact],
       exactUuid: exact,
       fragmentMatches: Array.isArray(message.content)
-        ? message.content.map(() => [])
+        ? message.content.map(() => ({
+            matchedUuids: [],
+            directMatchedUuids: [],
+            nestedMatches: [],
+          }))
         : [],
     };
   }
@@ -440,28 +484,80 @@ function resolveMessageMatch(
   }
 
   const matched = new Set<string>();
-  const fragmentMatches = message.content.map((block) => {
-    const directToolUuids = directToolPairUuidsForBlock(
+  const fragmentMatches = message.content.map((block) =>
+    resolveBlockMatch(
       message.role,
       block,
+      fragmentKeyToUuids,
       toolUseIdToUuids,
       toolResultIdToUuids,
-    );
-    if (directToolUuids.length > 0) {
-      for (const uuid of directToolUuids) matched.add(uuid);
-      return directToolUuids;
+      true,
+    ),
+  );
+  for (const fragmentMatch of fragmentMatches) {
+    for (const uuid of fragmentMatch.matchedUuids) {
+      matched.add(uuid);
     }
-
-    const key = fragmentKeyForBlock(message.role, block);
-    if (key === null) return [];
-    const uuids = fragmentKeyToUuids.get(key) ?? [];
-    for (const uuid of uuids) matched.add(uuid);
-    return uuids;
-  });
+  }
   return {
     matchedUuids: Array.from(matched),
     exactUuid: null,
     fragmentMatches,
+  };
+}
+
+function resolveBlockMatch(
+  role: "user" | "assistant" | "system",
+  block: unknown,
+  fragmentKeyToUuids: Map<string, string[]>,
+  toolUseIdToUuids: Map<string, string[]>,
+  toolResultIdToUuids: Map<string, string[]>,
+  allowToolPairFallback: boolean,
+): ResolvedBlockMatch {
+  const matched = new Set<string>();
+  const directMatched = new Set<string>();
+
+  if (allowToolPairFallback) {
+    const directToolUuids = directToolPairUuidsForBlock(
+      role,
+      block,
+      toolUseIdToUuids,
+      toolResultIdToUuids,
+    );
+    for (const uuid of directToolUuids) {
+      matched.add(uuid);
+      directMatched.add(uuid);
+    }
+  }
+
+  const key = fragmentKeyForBlock(role, block);
+  if (key !== null) {
+    for (const uuid of fragmentKeyToUuids.get(key) ?? []) {
+      matched.add(uuid);
+      directMatched.add(uuid);
+    }
+  }
+
+  const nestedMatches: ResolvedBlockMatch[] = [];
+  for (const item of nestedToolResultContent(block) ?? []) {
+    const nestedMatch = resolveBlockMatch(
+      role,
+      item,
+      fragmentKeyToUuids,
+      toolUseIdToUuids,
+      toolResultIdToUuids,
+      false,
+    );
+    nestedMatches.push(nestedMatch);
+    for (const uuid of nestedMatch.matchedUuids) {
+      matched.add(uuid);
+    }
+  }
+
+  return {
+    matchedUuids: Array.from(matched),
+    directMatchedUuids: Array.from(directMatched),
+    nestedMatches,
   };
 }
 
@@ -494,6 +590,15 @@ function fragmentKeyForBlock(role: string, block: unknown): string | null {
   if (record["type"] === "tool_result") {
     return `${role}:f:${JSON.stringify(normalizeToolResultBlock(record))}`;
   }
+  if (record["type"] === "image") {
+    return `${role}:f:${JSON.stringify(normalizeImageBlock(record))}`;
+  }
+  if (record["type"] === "document") {
+    return `${role}:f:${JSON.stringify(normalizeDocumentBlock(record))}`;
+  }
+  if (record["type"] === "search_result") {
+    return `${role}:f:${JSON.stringify(normalizeSearchResultBlock(record))}`;
+  }
   return null;
 }
 
@@ -513,7 +618,7 @@ function getToolResultToolUseId(block: unknown): string | null {
     : null;
 }
 
-function rewriteEmbeddedAnchorContent(
+function rewriteEmbeddedBlockContent(
   message: ApiMessage,
   block: Block,
   resolved: ResolvedMessageMatch | undefined,
@@ -533,38 +638,115 @@ function rewriteEmbeddedAnchorContent(
 
   for (let i = 0; i < message.content.length; i++) {
     const originalBlock = message.content[i];
-    const matchedUuids = resolved.fragmentMatches[i] ?? [];
-    const hits = matchedUuids
-      .map((uuid) => uuidToBlock.get(uuid))
-      .filter(
-        (hit): hit is { block: Block; role: "anchor" | "drop" } =>
-          hit !== undefined && hit.block.block_id === block.block_id,
-      );
-
-    if (hits.length === 0) {
-      rewritten.push(originalBlock);
-      continue;
+    const rewrite = rewriteResolvedBlock(
+      originalBlock,
+      resolved.fragmentMatches[i],
+      block,
+      uuidToBlock,
+      replacedAnchor,
+      message.content,
+    );
+    touched ||= rewrite.touched;
+    replacedAnchor ||= rewrite.replacedAnchor;
+    if (rewrite.value !== null) {
+      rewritten.push(rewrite.value);
     }
-
-    touched = true;
-    if (hits.some((hit) => hit.role === "anchor")) {
-      if (!replacedAnchor) {
-        rewritten.push({
-          type: "text",
-          text: formatSummaryContent(block, message.content),
-        });
-        replacedAnchor = true;
-      }
-      continue;
-    }
-
-    // Drop-only fragment from this block: omit it.
   }
 
-  if (!touched || !replacedAnchor) {
+  if (!touched) {
+    return null;
+  }
+
+  if (replacedAnchor) {
+    return rewritten;
+  }
+
+  if (!touched) {
     return null;
   }
   return rewritten;
+}
+
+function rewriteResolvedBlock(
+  originalBlock: unknown,
+  resolved: ResolvedBlockMatch | undefined,
+  block: Block,
+  uuidToBlock: Map<string, { block: Block; role: "anchor" | "drop" }>,
+  anchorAlreadyReplaced: boolean,
+  summaryContext: string | unknown[],
+): { value: unknown | null; touched: boolean; replacedAnchor: boolean } {
+  if (resolved === undefined) {
+    return { value: originalBlock, touched: false, replacedAnchor: false };
+  }
+
+  const directHits = resolved.directMatchedUuids
+    .map((uuid) => uuidToBlock.get(uuid))
+    .filter(
+      (hit): hit is { block: Block; role: "anchor" | "drop" } =>
+        hit !== undefined && hit.block.block_id === block.block_id,
+    );
+
+  if (directHits.length > 0) {
+    if (directHits.some((hit) => hit.role === "anchor")) {
+      if (anchorAlreadyReplaced) {
+        return { value: null, touched: true, replacedAnchor: true };
+      }
+      return {
+        value: {
+          type: "text",
+          text: formatSummaryContent(block, summaryContext),
+        },
+        touched: true,
+        replacedAnchor: true,
+      };
+    }
+    return { value: null, touched: true, replacedAnchor: false };
+  }
+
+  const nested = nestedToolResultContent(originalBlock);
+  if (nested === null || resolved.nestedMatches.length === 0) {
+    return { value: originalBlock, touched: false, replacedAnchor: false };
+  }
+
+  let touched = false;
+  let replacedAnchor = false;
+  const rewrittenNested: unknown[] = [];
+  for (let i = 0; i < nested.length; i++) {
+    const nestedRewrite = rewriteResolvedBlock(
+      nested[i],
+      resolved.nestedMatches[i],
+      block,
+      uuidToBlock,
+      anchorAlreadyReplaced || replacedAnchor,
+      summaryContext,
+    );
+    touched ||= nestedRewrite.touched;
+    replacedAnchor ||= nestedRewrite.replacedAnchor;
+    if (nestedRewrite.value !== null) {
+      rewrittenNested.push(nestedRewrite.value);
+    }
+  }
+
+  if (!touched) {
+    return { value: originalBlock, touched: false, replacedAnchor: false };
+  }
+
+  if (
+    typeof originalBlock !== "object" ||
+    originalBlock === null ||
+    (originalBlock as Record<string, unknown>)["type"] !== "tool_result"
+  ) {
+    return { value: originalBlock, touched: false, replacedAnchor };
+  }
+
+  return {
+    value: {
+      ...(originalBlock as Record<string, unknown>),
+      content: rewrittenNested,
+    },
+    touched: true,
+    replacedAnchor,
+  };
 }
 
 /**
@@ -647,6 +829,21 @@ function normalizeContent(content: string | unknown[]): string | unknown[] {
       continue;
     }
 
+    if (record["type"] === "image") {
+      normalized.push(normalizeImageBlock(record));
+      continue;
+    }
+
+    if (record["type"] === "document") {
+      normalized.push(normalizeDocumentBlock(record));
+      continue;
+    }
+
+    if (record["type"] === "search_result") {
+      normalized.push(normalizeSearchResultBlock(record));
+      continue;
+    }
+
     if (record["type"] === "text" && typeof record["text"] === "string") {
       normalized.push({
         ...record,
@@ -696,13 +893,9 @@ function trimSingleTrailingNewline(text: string): string {
 function normalizeToolResultBlock(
   block: Record<string, unknown>,
 ): Record<string, unknown> {
-  const content = block["content"];
-  if (typeof content !== "string") {
-    return block;
-  }
   return {
     ...block,
-    content: stripInjectedSystemReminder(trimSingleTrailingNewline(content)),
+    content: normalizeToolResultContent(block["content"]),
   };
 }
 
@@ -715,6 +908,74 @@ function normalizeToolUseBlock(
     name: block["name"],
     input: block["input"],
   };
+}
+
+function normalizeImageBlock(
+  block: Record<string, unknown>,
+): Record<string, unknown> {
+  return {
+    type: block["type"],
+    source: block["source"],
+  };
+}
+
+function normalizeDocumentBlock(
+  block: Record<string, unknown>,
+): Record<string, unknown> {
+  return {
+    type: block["type"],
+    source: block["source"],
+  };
+}
+
+function normalizeSearchResultBlock(
+  block: Record<string, unknown>,
+): Record<string, unknown> {
+  return block;
+}
+
+function normalizeToolResultContent(content: unknown): unknown {
+  if (typeof content === "string") {
+    return stripInjectedSystemReminder(trimSingleTrailingNewline(content));
+  }
+  if (Array.isArray(content)) {
+    return content.map(normalizeNestedToolResultBlock);
+  }
+  if (typeof content === "object" && content !== null) {
+    return normalizeNestedToolResultBlock(content);
+  }
+  return content;
+}
+
+function normalizeNestedToolResultBlock(block: unknown): unknown {
+  if (typeof block !== "object" || block === null) {
+    return block;
+  }
+
+  const record = block as Record<string, unknown>;
+  if (record["type"] === "text" && typeof record["text"] === "string") {
+    return {
+      ...record,
+      text: trimSingleTrailingNewline(record["text"]),
+    };
+  }
+  if (record["type"] === "image") {
+    return normalizeImageBlock(record);
+  }
+  if (record["type"] === "document") {
+    return normalizeDocumentBlock(record);
+  }
+  if (record["type"] === "search_result") {
+    return normalizeSearchResultBlock(record);
+  }
+  return block;
+}
+
+function nestedToolResultContent(block: unknown): unknown[] | null {
+  if (typeof block !== "object" || block === null) return null;
+  const record = block as Record<string, unknown>;
+  if (record["type"] !== "tool_result") return null;
+  return Array.isArray(record["content"]) ? record["content"] : null;
 }
 
 function stripInjectedSystemReminder(text: string): string {

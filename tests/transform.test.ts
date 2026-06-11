@@ -824,6 +824,275 @@ test("block does not partially apply when only non-anchor tool_result is present
   assert.deepEqual(result.blocks_inactive_in_request, [1]);
 });
 
+test("mixed user message keeps a live tool_result when only trailing text is compressed", () => {
+  const request = makeRequest([
+    { role: "user", content: "anchor" },
+    { role: "assistant", content: "drop me" },
+    {
+      role: "assistant",
+      content: [
+        { type: "tool_use", id: "live-tool", name: "Bash", input: { cmd: "pwd" } },
+      ],
+    },
+    {
+      role: "user",
+      content: [
+        {
+          type: "tool_result",
+          tool_use_id: "live-tool",
+          content: "rejected",
+          is_error: true,
+        },
+        { type: "text", text: "compressed follow-up" },
+      ],
+    },
+  ]);
+
+  const jsonl: JsonlMessage[] = [
+    { uuid: "u1", role: "user", content: "anchor" },
+    { uuid: "u2", role: "assistant", content: "drop me" },
+    {
+      uuid: "u_live_use",
+      role: "assistant",
+      content: [
+        { type: "tool_use", id: "live-tool", name: "Bash", input: { cmd: "pwd" } },
+      ],
+    },
+    {
+      uuid: "u_live_result",
+      role: "user",
+      content: [
+        {
+          type: "tool_result",
+          tool_use_id: "live-tool",
+          content: "rejected",
+          is_error: true,
+        },
+      ],
+    },
+    {
+      uuid: "u3",
+      role: "user",
+      content: [{ type: "text", text: "compressed follow-up" }],
+    },
+  ];
+
+  const block = makeBlock({
+    anchor_uuid: "u1",
+    compressed_uuids: ["u1", "u2", "u3"],
+    summary: "Collapsed opening.",
+  });
+
+  const result = applySubstitutions(request, jsonl, [block]);
+  const msgs = result.request.messages;
+
+  assert.deepEqual(msgs.map((m) => m.role), ["user", "assistant", "user"]);
+  assert.match(JSON.stringify(msgs[0]?.content), /Collapsed opening\./);
+  assert.deepEqual(msgs[1]?.content, [
+    { type: "tool_use", id: "live-tool", name: "Bash", input: { cmd: "pwd" } },
+  ]);
+  assert.deepEqual(msgs[2]?.content, [
+    {
+      type: "tool_result",
+      tool_use_id: "live-tool",
+      content: "rejected",
+      is_error: true,
+    },
+  ]);
+  assert.doesNotMatch(JSON.stringify(msgs[2]?.content), /compressed follow-up/);
+});
+
+test("mixed user message drops merged image fragments that belong to shelved turns", () => {
+  const imageA = {
+    type: "image",
+    source: { type: "base64", media_type: "image/jpeg", data: "aaa" },
+  };
+  const imageB = {
+    type: "image",
+    source: { type: "base64", media_type: "image/jpeg", data: "bbb" },
+  };
+
+  const request = makeRequest([
+    { role: "user", content: "anchor" },
+    { role: "assistant", content: "drop me" },
+    {
+      role: "user",
+      content: [
+        {
+          type: "tool_result",
+          tool_use_id: "live-tool",
+          content: "live output",
+          is_error: false,
+        },
+        imageA,
+        imageB,
+      ],
+    },
+  ]);
+
+  const jsonl: JsonlMessage[] = [
+    { uuid: "u1", role: "user", content: "anchor" },
+    { uuid: "u2", role: "assistant", content: "drop me" },
+    {
+      uuid: "u_live_result",
+      role: "user",
+      content: [
+        {
+          type: "tool_result",
+          tool_use_id: "live-tool",
+          content: "live output",
+          is_error: false,
+        },
+      ],
+    },
+    { uuid: "u3", role: "user", content: [imageA] },
+    { uuid: "u4", role: "user", content: [imageB] },
+  ];
+
+  const block = makeBlock({
+    anchor_uuid: "u1",
+    compressed_uuids: ["u1", "u2", "u3", "u4"],
+    summary: "Collapsed opening.",
+  });
+
+  const result = applySubstitutions(request, jsonl, [block]);
+  const msgs = result.request.messages;
+
+  assert.deepEqual(msgs.map((m) => m.role), ["user"]);
+  assert.match(JSON.stringify(msgs[0]?.content), /Collapsed opening\./);
+  assert.match(JSON.stringify(msgs[0]?.content), /live output/);
+  assert.doesNotMatch(JSON.stringify(msgs[0]?.content), /"image"/);
+});
+
+test("mixed user message drops merged document fragments that belong to shelved turns", () => {
+  const documentA = {
+    type: "document",
+    source: { type: "base64", media_type: "application/pdf", data: "doc-a" },
+  };
+  const documentB = {
+    type: "document",
+    source: { type: "base64", media_type: "application/pdf", data: "doc-b" },
+  };
+
+  const request = makeRequest([
+    { role: "user", content: "anchor" },
+    { role: "assistant", content: "drop me" },
+    {
+      role: "user",
+      content: [
+        {
+          type: "tool_result",
+          tool_use_id: "live-tool",
+          content: "live output",
+          is_error: false,
+        },
+        documentA,
+        documentB,
+      ],
+    },
+  ]);
+
+  const jsonl: JsonlMessage[] = [
+    { uuid: "u1", role: "user", content: "anchor" },
+    { uuid: "u2", role: "assistant", content: "drop me" },
+    {
+      uuid: "u_live_result",
+      role: "user",
+      content: [
+        {
+          type: "tool_result",
+          tool_use_id: "live-tool",
+          content: "live output",
+          is_error: false,
+        },
+      ],
+    },
+    { uuid: "u3", role: "user", content: [documentA] },
+    { uuid: "u4", role: "user", content: [documentB] },
+  ];
+
+  const block = makeBlock({
+    anchor_uuid: "u1",
+    compressed_uuids: ["u1", "u2", "u3", "u4"],
+    summary: "Collapsed opening.",
+  });
+
+  const result = applySubstitutions(request, jsonl, [block]);
+  const msgs = result.request.messages;
+
+  assert.deepEqual(msgs.map((m) => m.role), ["user"]);
+  assert.match(JSON.stringify(msgs[0]?.content), /Collapsed opening\./);
+  assert.match(JSON.stringify(msgs[0]?.content), /live output/);
+  assert.doesNotMatch(JSON.stringify(msgs[0]?.content), /"document"/);
+});
+
+test("mixed tool_result content drops nested document and search_result fragments that belong to shelved turns", () => {
+  const documentBlock = {
+    type: "document",
+    source: { type: "base64", media_type: "application/pdf", data: "nested-doc" },
+  };
+  const searchResultBlock = {
+    type: "search_result",
+    title: "Proxy note",
+    url: "https://example.test/proxy-note",
+    snippets: ["one", "two"],
+  };
+
+  const request = makeRequest([
+    { role: "user", content: "anchor" },
+    { role: "assistant", content: "drop me" },
+    {
+      role: "user",
+      content: [
+        {
+          type: "tool_result",
+          tool_use_id: "live-tool",
+          content: [
+            { type: "text", text: "live output" },
+            documentBlock,
+            searchResultBlock,
+          ],
+          is_error: false,
+        },
+      ],
+    },
+  ]);
+
+  const jsonl: JsonlMessage[] = [
+    { uuid: "u1", role: "user", content: "anchor" },
+    { uuid: "u2", role: "assistant", content: "drop me" },
+    {
+      uuid: "u_live_result",
+      role: "user",
+      content: [
+        {
+          type: "tool_result",
+          tool_use_id: "live-tool",
+          content: [{ type: "text", text: "live output" }],
+          is_error: false,
+        },
+      ],
+    },
+    { uuid: "u3", role: "user", content: [documentBlock] },
+    { uuid: "u4", role: "user", content: [searchResultBlock] },
+  ];
+
+  const block = makeBlock({
+    anchor_uuid: "u1",
+    compressed_uuids: ["u1", "u2", "u3", "u4"],
+    summary: "Collapsed opening.",
+  });
+
+  const result = applySubstitutions(request, jsonl, [block]);
+  const msgs = result.request.messages;
+
+  assert.deepEqual(msgs.map((m) => m.role), ["user"]);
+  assert.match(JSON.stringify(msgs[0]?.content), /Collapsed opening\./);
+  assert.match(JSON.stringify(msgs[0]?.content), /live output/);
+  assert.doesNotMatch(JSON.stringify(msgs[0]?.content), /"document"/);
+  assert.doesNotMatch(JSON.stringify(msgs[0]?.content), /search_result/);
+});
+
 test("block whose UUIDs aren't in the request is reported as inactive_in_request", () => {
   const request = makeRequest([{ role: "user", content: "current" }]);
   const jsonl = makeJsonl([
