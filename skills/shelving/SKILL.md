@@ -157,6 +157,40 @@ Note the cache tradeoff: revision necessarily breaks the byte-identical
 summary that `recompress` preserves. Revise when the summary is wrong or
 thin; use plain `recompress` when it was merely shelved and drawn.
 
+## Reading long texts (read-and-release)
+
+Validated against a 319-page PDF read in 8 arcs (2026-06-09/11). The pattern
+lets a text longer than the context window be read with compounding
+understanding: hold the current chunk at full fidelity, release prior chunks
+to summaries, keep the mental model in visible reflections.
+
+Per chunk:
+
+1. `start_arc` with a label (`book-3`). Safe to call mid-turn — closure
+   handles tool_result anchors.
+2. Read the chunk (15–20 PDF pages works well).
+3. Write the reflection as a **visible turn** — this is the marginalia that
+   survives; it carries what the chunk *changed* in your understanding.
+4. `compress_arc` with a delta-shaped summary: what this chunk added to the
+   model-so-far, plus a pointer (file, page range), plus sections flagged for
+   later, plus what was dropped and how confidently.
+
+Findings from first use:
+
+- **Delta-shaped summaries compound.** Each summary assumes the prior ones;
+  together they form the mental model a human reader keeps. What accumulates
+  is marginalia + model, with verbatim text released but re-drawable.
+- **The reflection turn does double duty.** It is both the reading's product
+  and the part of the arc that survives compression (compress_arc excludes
+  the closing turn). Write it for the future reader you will be.
+- **Reading-mode residue is auditable.** Unlike human mental models, every
+  reflection can be checked against the text on disk: decompress a chunk (or
+  re-read the pages) and verify your own marginalia. Compression confabulation
+  (field-guide 08) is the failure mode; the disk is the check.
+- **You need not read sequentially.** After the structural chunks, jump by
+  pull (ToC-guided). Flag unread sections in summaries as re-drawable rather
+  than walking them out of completeness.
+
 ## Oscillation is normal
 
 Shelve, draw, re-shelve as needs change — the practice is a continuous breath
@@ -172,4 +206,7 @@ Mechanics: the shelving repo (Stage 1). Summary guidance: folded in from
 developed and measured against real session restorations (sessions 0704f048,
 bbb00a54) before live shelving existed. Practice framing: memory-practice and
 memory-vocabulary threads, field-guide 08. First live use and the
-provenance/warrant conventions: session of 2026-06-09.
+provenance/warrant conventions: session of 2026-06-09. Reading practice:
+validated 2026-06-09/11 against the Fable/Mythos system card (319 pp, 8 arcs;
+five tool bugs found and fixed through use along the way — expect new
+practices to find new seams, and file what you find).
