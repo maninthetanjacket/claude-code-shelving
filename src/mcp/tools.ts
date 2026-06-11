@@ -1448,42 +1448,47 @@ export async function handleCompressArc(args: unknown): Promise<ToolResult> {
 
   // Collect the contiguous UUID range. Use the same collapse-consecutive
   // semantics as the existing validation logic to handle any sidechain
-  // duplication in the JSONL.
+  // duplication in the JSONL, then run the same pair-closure pass that
+  // ordinary compress uses so bookmark ranges cannot start/end on orphaned
+  // tool_result/tool_use turns.
   const expandedUuidStream = collapseConsecutiveDuplicates(
     messages.map((m) => m.uuid),
   );
-  // Find anchor/end positions in the collapsed stream by their UUIDs.
-  const anchorPos = expandedUuidStream.indexOf(bookmark.anchor_uuid);
   const endUuid = messages[endIdx]?.uuid;
   if (endUuid === undefined) {
     return errorResult("could not resolve end UUID for the bookmarked range");
   }
-  // Find the LAST occurrence of endUuid in the collapsed stream to be safe.
-  let endPos = -1;
-  for (let i = expandedUuidStream.length - 1; i >= 0; i--) {
-    if (expandedUuidStream[i] === endUuid) {
-      endPos = i;
-      break;
-    }
-  }
-  if (anchorPos === -1 || endPos === -1 || anchorPos > endPos) {
+  const selectedRange = findRangePositions(
+    expandedUuidStream,
+    bookmark.anchor_uuid,
+    endUuid,
+  );
+  if (selectedRange === null) {
     return errorResult(
       "could not assemble a contiguous range from bookmark anchor to latest user message",
     );
   }
-  const compressedUuids = expandedUuidStream.slice(anchorPos, endPos + 1);
-  const estimatedTokens = estimateTokensForUuidRange(
+  const closedRange = closeRangeForToolPairs(
     messages,
-    bookmark.anchor_uuid,
-    endUuid,
+    selectedRange.startPos,
+    selectedRange.endPos,
+  );
+  const compressedUuids = expandedUuidStream.slice(
+    closedRange.startPos,
+    closedRange.endPos + 1,
   );
 
   // Build and persist the block (same shape as handleCompress).
   const blockId = await nextBlockId(sessionId);
   const anchorUuid = compressedUuids[0];
+  const closedEndUuid = compressedUuids[compressedUuids.length - 1];
   if (anchorUuid === undefined) {
     return errorResult("bookmark range produced an empty UUID list");
   }
+  const estimatedTokens =
+    closedEndUuid === undefined
+      ? 0
+      : estimateTokensForUuidRange(messages, anchorUuid, closedEndUuid);
 
   const block: Block = {
     block_id: blockId,

@@ -2,7 +2,13 @@ import { readFile, writeFile, readdir, mkdir, rename, stat } from "node:fs/promi
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import type { Block, SessionId } from "./types.js";
-import { blockPath, blockTempPath, sessionDir } from "./paths.js";
+import {
+  blockPath,
+  blockTempPath,
+  nextBlockIdPath,
+  nextBlockIdTempPath,
+  sessionDir,
+} from "./paths.js";
 
 /**
  * Registry operations for substitution blocks. Both the MCP server and the proxy use these.
@@ -37,10 +43,7 @@ export async function writeBlock(
   sessionId: SessionId,
   block: Block,
 ): Promise<void> {
-  const dir = sessionDir(sessionId);
-  if (!existsSync(dir)) {
-    await mkdir(dir, { recursive: true });
-  }
+  await ensureSessionDir(sessionId);
   const tempPath = blockTempPath(sessionId, block.block_id);
   const finalPath = blockPath(sessionId, block.block_id);
   const normalized = normalizeBlockRecord(block);
@@ -78,12 +81,21 @@ export async function listActiveBlocks(
 
 /**
  * Compute the next block_id to assign for a new block in this session.
- * Block ids are monotonic per session, never reused.
+ * Block ids are monotonic per session, never reused. The primary source of
+ * truth is a persistent per-session counter; existing block files are only
+ * consulted as a recovery floor if the counter is missing or behind.
  */
 export async function nextBlockId(sessionId: SessionId): Promise<number> {
+  await ensureSessionDir(sessionId);
+
+  const storedNextId = await readPersistedNextBlockId(sessionId);
   const blocks = await listBlocks(sessionId);
-  if (blocks.length === 0) return 1;
-  return Math.max(...blocks.map((b) => b.block_id)) + 1;
+  const floorFromBlocks =
+    blocks.length === 0 ? 1 : Math.max(...blocks.map((block) => block.block_id)) + 1;
+  const nextId = Math.max(storedNextId ?? 1, floorFromBlocks);
+
+  await persistNextBlockId(sessionId, nextId + 1);
+  return nextId;
 }
 
 /**
@@ -105,16 +117,48 @@ export async function setBlockActive(
 
 /**
  * Get the directory mtime for the session's shelving directory.
- * The proxy uses this for cheap cache invalidation: if mtime hasn't changed
- * since last read, no block files were created/modified/deleted.
+ * The proxy uses this for cheap cache invalidation. We return the newest mtime
+ * across the session directory and its immediate children so overwriting an
+ * existing block file still invalidates the cache even if the directory mtime
+ * resolution is coarse.
  *
  * Returns null if the directory doesn't exist (proxy treats as no-active-blocks).
  */
 export async function sessionMtime(sessionId: SessionId): Promise<number | null> {
   const dir = sessionDir(sessionId);
   if (!existsSync(dir)) return null;
-  const s = await stat(dir);
-  return s.mtimeMs;
+  let newestMtime = (await stat(dir)).mtimeMs;
+  for (const entry of await readdir(dir)) {
+    const entryMtime = (await stat(join(dir, entry))).mtimeMs;
+    if (entryMtime > newestMtime) newestMtime = entryMtime;
+  }
+  return newestMtime;
+}
+
+async function ensureSessionDir(sessionId: SessionId): Promise<void> {
+  const dir = sessionDir(sessionId);
+  if (!existsSync(dir)) {
+    await mkdir(dir, { recursive: true });
+  }
+}
+
+async function readPersistedNextBlockId(sessionId: SessionId): Promise<number | null> {
+  const path = nextBlockIdPath(sessionId);
+  if (!existsSync(path)) return null;
+
+  const raw = await readFile(path, "utf-8");
+  const parsed = Number.parseInt(raw.trim(), 10);
+  return Number.isInteger(parsed) && parsed >= 1 ? parsed : null;
+}
+
+async function persistNextBlockId(
+  sessionId: SessionId,
+  nextId: number,
+): Promise<void> {
+  const tempPath = nextBlockIdTempPath(sessionId);
+  const finalPath = nextBlockIdPath(sessionId);
+  await writeFile(tempPath, `${nextId}\n`, "utf-8");
+  await rename(tempPath, finalPath);
 }
 
 function normalizeBlockRecord(block: Block): Block {

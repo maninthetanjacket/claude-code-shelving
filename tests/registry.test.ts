@@ -138,15 +138,17 @@ test("listActiveBlocks filters by active flag", async () => {
   );
 });
 
-test("nextBlockId is max + 1, including inactive blocks", async () => {
+test("nextBlockId stays monotonic even if block files are manually deleted", async () => {
   await writeBlock(TEST_SESSION, makeBlock(1));
-  assert.equal(await nextBlockId(TEST_SESSION), 2);
-
   await writeBlock(TEST_SESSION, makeBlock(2, { active: false }));
-  assert.equal(await nextBlockId(TEST_SESSION), 3);
+  await writeBlock(TEST_SESSION, makeBlock(3));
 
-  await writeBlock(TEST_SESSION, makeBlock(7));
-  assert.equal(await nextBlockId(TEST_SESSION), 8);
+  assert.equal(await nextBlockId(TEST_SESSION), 4);
+
+  await rm(join(sessionDir(TEST_SESSION), "3.json"), { force: true });
+  await rm(join(sessionDir(TEST_SESSION), "2.json"), { force: true });
+
+  assert.equal(await nextBlockId(TEST_SESSION), 5);
 });
 
 test("setBlockActive flips active flag and persists", async () => {

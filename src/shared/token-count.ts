@@ -50,15 +50,24 @@ export function countTextTokens(text: string): number {
 /**
  * Calibrated estimate of the Claude input tokens one message's content
  * occupies: content tokens scaled to Claude's density, plus the billed
- * fraction of any extended-thinking signature.
+ * fraction of any extended-thinking signature, plus explicit image blocks.
  */
 export function countContentTokens(content: string | unknown[]): number {
   const contentTokens = countTextTokens(messageContentToString(content));
   const signatureTokens = countTextTokens(messageSignaturesToString(content));
+  const imageTokens = countImageTokens(content);
   return Math.round(
-    CONTENT_CALIBRATION * contentTokens + SIGNATURE_CALIBRATION * signatureTokens,
+    CONTENT_CALIBRATION * contentTokens +
+      SIGNATURE_CALIBRATION * signatureTokens +
+      imageTokens,
   );
 }
+
+/** Anthropic image input is roughly width*height/750 tokens when dimensions are known. */
+export const IMAGE_TOKEN_DIVISOR = 750;
+
+/** Fallback used when a JSONL image block does not expose dimensions. */
+export const IMAGE_FALLBACK_TOKENS = 1500;
 
 /**
  * Concatenate the encrypted `signature` payloads of any thinking blocks in a
@@ -80,8 +89,9 @@ export function messageSignaturesToString(content: string | unknown[]): string {
 
 /**
  * Flatten a message's content into a single string, covering every block type
- * that carries tokens: text, thinking, tool_use (name + JSON input), and
- * tool_result (string or nested text/blocks). Also used for preview snippets.
+ * that carries textual tokens: text, thinking, tool_use (name + JSON input),
+ * and tool_result (string or nested text/blocks). Also used for preview
+ * snippets. Image blocks are counted separately in countContentTokens.
  */
 export function messageContentToString(content: string | unknown[]): string {
   if (typeof content === "string") {
@@ -132,6 +142,100 @@ function contentBlockToString(item: unknown): string {
   }
 
   return "";
+}
+
+function countImageTokens(content: string | unknown[]): number {
+  if (!Array.isArray(content)) return 0;
+  let total = 0;
+  for (const item of content) {
+    total += contentBlockImageTokens(item);
+  }
+  return total;
+}
+
+function contentBlockImageTokens(item: unknown): number {
+  if (!item || typeof item !== "object") return 0;
+
+  const block = item as Record<string, unknown>;
+  if (block["type"] === "image") {
+    const dimensions = imageBlockDimensions(block);
+    if (dimensions === null) {
+      return IMAGE_FALLBACK_TOKENS;
+    }
+    return (dimensions.width * dimensions.height) / IMAGE_TOKEN_DIVISOR;
+  }
+
+  if (block["type"] === "tool_result") {
+    return nestedImageTokens(block["content"]);
+  }
+
+  return 0;
+}
+
+function nestedImageTokens(value: unknown): number {
+  if (Array.isArray(value)) {
+    let total = 0;
+    for (const item of value) {
+      total += contentBlockImageTokens(item);
+    }
+    return total;
+  }
+  if (value && typeof value === "object") {
+    return contentBlockImageTokens(value);
+  }
+  return 0;
+}
+
+function imageBlockDimensions(
+  block: Record<string, unknown>,
+): { width: number; height: number } | null {
+  const candidates = [
+    block,
+    objectField(block, "source"),
+    objectField(block, "metadata"),
+    objectField(block, "image"),
+    objectField(block, "dimensions"),
+    objectField(block, "size"),
+  ].filter((candidate): candidate is Record<string, unknown> => candidate !== null);
+
+  for (const candidate of candidates) {
+    const width = positiveNumberField(candidate, [
+      "width",
+      "width_px",
+      "pixel_width",
+    ]);
+    const height = positiveNumberField(candidate, [
+      "height",
+      "height_px",
+      "pixel_height",
+    ]);
+    if (width !== null && height !== null) {
+      return { width, height };
+    }
+  }
+
+  return null;
+}
+
+function objectField(
+  record: Record<string, unknown>,
+  key: string,
+): Record<string, unknown> | null {
+  const value = record[key];
+  return value && typeof value === "object" ? (value as Record<string, unknown>) : null;
+}
+
+function positiveNumberField(
+  record: Record<string, unknown>,
+  keys: string[],
+): number | null {
+  for (const key of keys) {
+    const value = record[key];
+    if (typeof value === "number" && Number.isFinite(value) && value > 0) {
+      return value;
+    }
+  }
+  return null;
 }
 
 function stableStringify(value: unknown): string {

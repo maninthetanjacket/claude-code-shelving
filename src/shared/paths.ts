@@ -9,6 +9,7 @@ import type { SessionId } from "./types.js";
  *   ~/.claude/shelving/                       (root)
  *     <session-id>/                           (per-session directory)
  *       <block-id>.json                       (one file per block)
+ *       next-block-id                         (monotonic id counter)
  *
  * The root can be overridden via the `CLAUDE_SHELVING_DIR` environment
  * variable, primarily for testing. When unset, defaults to ~/.claude/shelving.
@@ -33,6 +34,16 @@ export function blockPath(sessionId: SessionId, blockId: number): string {
 /** Temp filename used by atomic writes (rename-after-write). */
 export function blockTempPath(sessionId: SessionId, blockId: number): string {
   return join(sessionDir(sessionId), `${blockId}.json.tmp`);
+}
+
+/** Path to the per-session monotonic block-id counter. */
+export function nextBlockIdPath(sessionId: SessionId): string {
+  return join(sessionDir(sessionId), "next-block-id");
+}
+
+/** Temp filename used by atomic writes for the block-id counter. */
+export function nextBlockIdTempPath(sessionId: SessionId): string {
+  return join(sessionDir(sessionId), "next-block-id.tmp");
 }
 
 /** Path to the per-session bookmarks file. */

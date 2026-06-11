@@ -14,6 +14,7 @@ import {
   handleCompressArc,
   dispatch,
 } from "../src/mcp/tools.ts";
+import { applySubstitutions } from "../src/proxy/transform.ts";
 import { sessionDir } from "../src/shared/paths.ts";
 import { readBlock } from "../src/shared/registry.ts";
 import { getBookmark } from "../src/shared/bookmarks.ts";
@@ -645,6 +646,51 @@ test("compress estimation counts the calibrated fraction of thinking signatures"
   );
 });
 
+test("compress estimation includes image blocks nested inside tool_result content", async () => {
+  await writeRawSessionJsonl(TEST_SESSION, [
+    {
+      type: "user",
+      uuid: "u1",
+      message: {
+        role: "user",
+        content: [
+          {
+            type: "tool_result",
+            content: [
+              { type: "text", text: "rendered pdf pages" },
+              {
+                type: "image",
+                width: 600,
+                height: 900,
+                source: { type: "base64", media_type: "image/png", data: "abc" },
+              },
+              {
+                type: "image",
+                source: { type: "base64", media_type: "image/png", data: "def" },
+              },
+            ],
+          },
+        ],
+      },
+    },
+  ]);
+
+  const result = await handleCompress({
+    session_id: TEST_SESSION,
+    compressed_uuids: ["u1"],
+    summary: "s",
+  });
+
+  assert.equal(result.isError, undefined);
+  const payload = parseResult(result) as Record<string, unknown>;
+  const expected = Math.round(
+    CONTENT_CALIBRATION * countTextTokens("rendered pdf pages") +
+      600 * 900 / 750 +
+      1500,
+  );
+  assert.equal(payload["original_tokens"], expected);
+});
+
 test("compress falls back to CLAUDE_CODE_SESSION_ID env var when session_id omitted", async () => {
   const prev = process.env["CLAUDE_CODE_SESSION_ID"];
   process.env["CLAUDE_CODE_SESSION_ID"] = TEST_SESSION;
@@ -1227,6 +1273,104 @@ test("compress_arc captures the range from bookmark to last user message", async
   // The bookmark should be consumed after a successful compress_arc.
   const consumed = await getBookmark(TEST_SESSION, "chunk-1");
   assert.equal(consumed, null);
+});
+
+test("compress_arc closes a bookmark range that starts on a tool_result anchor", async () => {
+  const toolUse = {
+    type: "tool_use",
+    id: "toolu_arc",
+    name: "Bash",
+    input: { cmd: "pwd" },
+  };
+  const toolResult = {
+    type: "tool_result",
+    tool_use_id: "toolu_arc",
+    content: [{ type: "text", text: "/tmp/project" }],
+    is_error: false,
+  };
+  const jsonlLines = [
+    {
+      type: "user",
+      uuid: "u1",
+      message: {
+        role: "user",
+        content: "start work",
+      },
+    },
+    {
+      type: "assistant",
+      uuid: "a1",
+      message: {
+        role: "assistant",
+        content: [toolUse],
+      },
+    },
+    {
+      type: "user",
+      uuid: "u2",
+      message: {
+        role: "user",
+        content: [toolResult],
+      },
+    },
+    {
+      type: "assistant",
+      uuid: "a2",
+      message: {
+        role: "assistant",
+        content: "tool handled",
+      },
+    },
+    {
+      type: "user",
+      uuid: "u3",
+      message: {
+        role: "user",
+        content: "next task",
+      },
+    },
+  ];
+  await writeRawSessionJsonl(TEST_SESSION, jsonlLines);
+
+  const { setBookmark } = await import("../src/shared/bookmarks.ts");
+  await setBookmark(TEST_SESSION, {
+    label: "tool-anchor",
+    anchor_uuid: "u2",
+    created_at: new Date().toISOString(),
+  });
+
+  const result = await handleCompressArc({
+    session_id: TEST_SESSION,
+    label: "tool-anchor",
+    summary: "closed tool arc",
+  });
+  assert.equal(result.isError, undefined);
+
+  const payload = parseResult(result) as Record<string, unknown>;
+  assert.equal(payload["anchor_uuid"], "a1");
+  assert.equal(payload["compressed_count"], 4);
+
+  const block = await readBlock(TEST_SESSION, payload["block_id"] as number);
+  assert.notEqual(block, null);
+  assert.deepEqual(block?.compressed_uuids, ["a1", "u2", "a2", "u3"]);
+
+  const jsonlMessages = jsonlLines.map((line) => ({
+    uuid: line.uuid,
+    role: line.message.role,
+    content: line.message.content,
+  }));
+  const request = {
+    messages: jsonlMessages.map(({ role, content }) => ({ role, content })),
+  };
+  const transformed = applySubstitutions(request, jsonlMessages, [block!]);
+  assert.equal(transformed.anchors_substituted, 1);
+  assert.equal(transformed.messages_dropped, 3);
+  assert.equal(transformed.request.messages.length, 2);
+
+  const transformedJson = JSON.stringify(transformed.request.messages);
+  assert.match(transformedJson, /closed tool arc/);
+  assert.doesNotMatch(transformedJson, /toolu_arc/);
+  assert.doesNotMatch(transformedJson, /tool_result/);
 });
 
 test("compress_arc errors if no user message exists at or after the bookmark", async () => {
