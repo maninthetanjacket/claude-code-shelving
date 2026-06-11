@@ -1,6 +1,6 @@
 import { test, before, after, beforeEach } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, rm, readdir } from "node:fs/promises";
+import { mkdtemp, rm, readdir, mkdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -39,6 +39,7 @@ function makeBlock(id: number, overrides: Partial<Block> = {}): Block {
   return {
     block_id: id,
     created_at: "2026-05-08T14:30:00Z",
+    kind: "compression",
     active: true,
     anchor_uuid: `msg_anchor_${id}`,
     compressed_uuids: [`msg_anchor_${id}`, `msg_${id}_b`, `msg_${id}_c`],
@@ -65,6 +66,32 @@ test("write then read round-trips correctly", async () => {
 
   const restored = await readBlock(TEST_SESSION, 1);
   assert.deepEqual(restored, original);
+});
+
+test("readBlock defaults missing kind to compression for older registry files", async () => {
+  await mkdir(sessionDir(TEST_SESSION), { recursive: true });
+  await writeFile(
+    join(sessionDir(TEST_SESSION), "1.json"),
+    JSON.stringify({
+      block_id: 1,
+      created_at: "2026-05-08T14:30:00Z",
+      active: true,
+      anchor_uuid: "msg_anchor_1",
+      compressed_uuids: ["msg_anchor_1"],
+      summary: "legacy summary",
+      original_tokens: 10,
+      summary_tokens: 5,
+      focus: null,
+      parent_block_id: null,
+    }, null, 2) + "\n",
+    "utf-8",
+  );
+
+  const restored = await readBlock(TEST_SESSION, 1);
+  assert.equal(restored?.kind, "compression");
+
+  const listed = await listBlocks(TEST_SESSION);
+  assert.equal(listed[0]?.kind, "compression");
 });
 
 test("write creates session directory if missing", async () => {

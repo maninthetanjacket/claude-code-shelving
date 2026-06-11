@@ -1,4 +1,5 @@
 import type { Tool, CallToolResult } from "@modelcontextprotocol/sdk/types.js";
+import { readFile } from "node:fs/promises";
 import {
   listBlocks,
   nextBlockId,
@@ -12,6 +13,7 @@ import {
 } from "../shared/bookmarks.js";
 import { blockToMeta, type Block } from "../shared/types.js";
 import {
+  requireString,
   requireNonEmptyString,
   requireStringArray,
   requirePositiveInt,
@@ -25,6 +27,7 @@ import {
 import { loadSessionMessages } from "../proxy/jsonl.js";
 import type { JsonlMessage } from "../proxy/transform.js";
 import {
+  countTextTokens,
   countContentTokens,
   messageContentToString,
 } from "../shared/token-count.js";
@@ -144,6 +147,60 @@ export const TOOLS: Tool[] = [
         },
       },
       required: ["block_id"],
+    },
+  },
+  {
+    name: "place",
+    description:
+      "Places authored content at a single anchor message in a Claude Code session. " +
+      "On subsequent API requests, the proxy substitutes the authored content for that one anchor message only. " +
+      "The original conversation remains in the session JSONL on disk and can be restored via decompress. " +
+      "Specify the anchor by turn number, anchor_uuid, or unique phrase match. " +
+      "Pass either content or content_file. Preview returns the anchor turn, current content snippet, and replacement content before confirmation.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        session_id: {
+          type: "string",
+          description:
+            "Claude Code session UUID. Optional: defaults to CLAUDE_CODE_SESSION_ID when available; otherwise the server falls back to the most recently modified session transcript for CLAUDE_PROJECT_DIR. Pass explicitly only to target a different session.",
+        },
+        turn: {
+          type: "integer",
+          minimum: 1,
+          description: "The 1-indexed turn number whose content should be replaced.",
+        },
+        anchor_uuid: {
+          type: "string",
+          description: "The UUID of the single anchor turn whose content should be replaced.",
+        },
+        phrase: {
+          type: "string",
+          description:
+            "Text phrase that must match exactly one turn in the session. That matching turn becomes the anchor.",
+        },
+        content: {
+          type: "string",
+          description:
+            "Inline authored content to place at the anchor turn. Use this OR content_file.",
+        },
+        content_file: {
+          type: "string",
+          description:
+            "Server-side path to a file whose full contents will be placed at the anchor turn. Use this OR content.",
+        },
+        preview_only: {
+          type: "boolean",
+          description:
+            "If true, only return preview info (anchor turn, current snippet, replacement content) without performing placement. Default false.",
+        },
+        confirm: {
+          type: "boolean",
+          description:
+            "If true, skip preview and proceed directly to placement. Required when preview_only=false.",
+        },
+      },
+      required: [],
     },
   },
   {
@@ -530,6 +587,7 @@ export async function handleCompress(args: unknown): Promise<ToolResult> {
   const block: Block = {
     block_id: blockId,
     created_at: new Date().toISOString(),
+    kind: "compression",
     active: true,
     anchor_uuid: anchorUuid,
     compressed_uuids: rangeUuids,
@@ -552,6 +610,140 @@ export async function handleCompress(args: unknown): Promise<ToolResult> {
   });
 }
 
+export async function handlePlace(args: unknown): Promise<ToolResult> {
+  if (typeof args !== "object" || args === null) {
+    return errorResult("arguments must be an object");
+  }
+  const a = args as Record<string, unknown>;
+
+  let sessionId: string;
+  let turn: number | undefined;
+  let anchorUuidArg: string | undefined;
+  let phrase: string | undefined;
+  let inlineContent: string | undefined;
+  let contentFile: string | undefined;
+  let previewOnly: boolean;
+  let confirm: boolean;
+  try {
+    sessionId = await resolveSessionIdArg(a["session_id"]);
+    turn = optionalPositiveInt(a["turn"], "turn");
+    anchorUuidArg = optionalNonEmptyString(a["anchor_uuid"], "anchor_uuid");
+    phrase = optionalNonEmptyString(a["phrase"], "phrase");
+    inlineContent = optionalString(a["content"], "content");
+    contentFile = optionalNonEmptyString(a["content_file"], "content_file");
+    previewOnly = optionalBoolean(a["preview_only"], "preview_only") ?? false;
+    confirm = optionalBoolean(a["confirm"], "confirm") ?? false;
+  } catch (e) {
+    if (e instanceof ValidationError) return errorResult(e.message);
+    throw e;
+  }
+
+  const anchorSelectors = [turn !== undefined, anchorUuidArg !== undefined, phrase !== undefined]
+    .filter(Boolean).length;
+  if (anchorSelectors === 0) {
+    return errorResult("Must provide exactly one anchor selector: turn, anchor_uuid, or phrase");
+  }
+  if (anchorSelectors > 1) {
+    return errorResult("Cannot specify multiple anchor selectors; choose turn, anchor_uuid, or phrase");
+  }
+
+  if (!previewOnly && !confirm) {
+    return errorResult(
+      "Placement requires confirm=true to proceed, or set preview_only=true to preview first",
+    );
+  }
+
+  if ((inlineContent === undefined) === (contentFile === undefined)) {
+    return errorResult("Must provide exactly one content source: content or content_file");
+  }
+
+  let replacementContent: string;
+  try {
+    replacementContent =
+      inlineContent !== undefined
+        ? inlineContent
+        : await readPlacementFile(requireString(contentFile, "content_file"));
+  } catch (e) {
+    if (e instanceof ValidationError) return errorResult(e.message);
+    throw e;
+  }
+
+  if (replacementContent.trim().length === 0) {
+    return errorResult("placement content must contain non-whitespace characters");
+  }
+
+  const { path, messages } = await loadSessionMessages(sessionId);
+  if (path === null) {
+    return errorResult(`Session JSONL not found for session ${sessionId}`);
+  }
+  if (messages.length === 0) {
+    return errorResult(`Session JSONL for ${sessionId} contains no messages to anchor at`);
+  }
+
+  const turns = collectSessionTurns(messages);
+  const resolvedAnchor = resolvePlacementAnchor(turns, turn, anchorUuidArg, phrase);
+  if ("error" in resolvedAnchor) {
+    return errorResult(resolvedAnchor.error);
+  }
+
+  const closedRange = closeRangeForToolPairs(
+    messages,
+    resolvedAnchor.turn.index,
+    resolvedAnchor.turn.index,
+  );
+  if (closedRange.info !== null) {
+    return errorResult(
+      "Placement must remain exactly one message and therefore refuses tool-pair auto-extension. " +
+        closedRange.info.note,
+    );
+  }
+
+  if (previewOnly) {
+    return successResult({
+      preview: true,
+      session_id: sessionId,
+      anchor_turn: resolvedAnchor.turn.turn,
+      anchor_uuid: resolvedAnchor.turn.uuid,
+      anchor_snippet: resolvedAnchor.turn.preview,
+      replacement_content: replacementContent,
+      note: "Pass confirm=true to perform placement",
+    });
+  }
+
+  const blockId = await nextBlockId(sessionId);
+  const estimatedOriginalTokens = estimateTokensForUuidRange(
+    messages,
+    resolvedAnchor.turn.uuid,
+    resolvedAnchor.turn.uuid,
+  );
+  const block: Block = {
+    block_id: blockId,
+    created_at: new Date().toISOString(),
+    kind: "placement",
+    active: true,
+    anchor_uuid: resolvedAnchor.turn.uuid,
+    compressed_uuids: [resolvedAnchor.turn.uuid],
+    summary: replacementContent,
+    original_tokens: estimatedOriginalTokens,
+    summary_tokens: countTextTokens(replacementContent),
+    focus: null,
+    parent_block_id: null,
+  };
+
+  await writeBlock(sessionId, block);
+
+  return successResult({
+    block_id: blockId,
+    kind: block.kind,
+    anchor_turn: resolvedAnchor.turn.turn,
+    anchor_uuid: block.anchor_uuid,
+    compressed_count: 1,
+    original_tokens: block.original_tokens,
+    summary_tokens: block.summary_tokens,
+    active: true,
+  });
+}
+
 function optionalStringArray(value: unknown, field: string): string[] | undefined {
   if (value === undefined || value === null) return undefined;
   return requireStringArray(value, field);
@@ -563,6 +755,131 @@ function optionalBoolean(value: unknown, field: string): boolean | undefined {
     throw new ValidationError(`${field} must be a boolean if provided`);
   }
   return value;
+}
+
+type SessionTurn = {
+  index: number;
+  turn: number;
+  uuid: string;
+  role: "user" | "assistant";
+  messages: JsonlMessage[];
+  text: string;
+  preview: string;
+};
+
+function collectSessionTurns(messages: JsonlMessage[]): SessionTurn[] {
+  const turns: SessionTurn[] = [];
+  let currentMessages: JsonlMessage[] = [];
+  let currentUuid: string | null = null;
+
+  const flush = () => {
+    if (currentUuid === null || currentMessages.length === 0) return;
+    const first = currentMessages[0];
+    if (first === undefined) return;
+    const text = currentMessages
+      .map((message) => messageContentToString(message.content))
+      .filter((part) => part.trim().length > 0)
+      .join("\n");
+    turns.push({
+      index: turns.length,
+      turn: turns.length + 1,
+      uuid: currentUuid,
+      role: first.role,
+      messages: currentMessages,
+      text,
+      preview: text.trim().length > 0 ? previewSnippet(text) : messageTagForTurn(first.role, currentMessages),
+    });
+  };
+
+  for (const message of messages) {
+    if (message.uuid !== currentUuid) {
+      flush();
+      currentUuid = message.uuid;
+      currentMessages = [message];
+      continue;
+    }
+    currentMessages.push(message);
+  }
+  flush();
+
+  return turns;
+}
+
+function resolvePlacementAnchor(
+  turns: SessionTurn[],
+  turn: number | undefined,
+  anchorUuid: string | undefined,
+  phrase: string | undefined,
+): { turn: SessionTurn } | { error: string } {
+  if (turn !== undefined) {
+    const selected = turns[turn - 1];
+    if (selected === undefined) {
+      return { error: `turn ${turn} is out of bounds (1-${turns.length})` };
+    }
+    return { turn: selected };
+  }
+
+  if (anchorUuid !== undefined) {
+    const selected = turns.find((candidate) => candidate.uuid === anchorUuid);
+    if (selected === undefined) {
+      return { error: `anchor_uuid ${anchorUuid} was not found in the session JSONL` };
+    }
+    return { turn: selected };
+  }
+
+  if (phrase !== undefined) {
+    const lower = phrase.toLowerCase();
+    const matches = turns.filter((candidate) => candidate.text.toLowerCase().includes(lower));
+    if (matches.length === 0) {
+      return { error: `Could not find phrase "${phrase}" in any turn content` };
+    }
+    if (matches.length > 1) {
+      return {
+        error:
+          `Phrase "${phrase}" matched multiple turns (${matches.map((m) => m.turn).join(", ")}). ` +
+          "Placement requires a unique anchor.",
+      };
+    }
+    const selected = matches[0];
+    if (selected === undefined) {
+      return { error: `Could not resolve phrase "${phrase}" to a unique turn` };
+    }
+    return { turn: selected };
+  }
+
+  return { error: "Must provide exactly one anchor selector: turn, anchor_uuid, or phrase" };
+}
+
+function messageTagForTurn(
+  role: "user" | "assistant",
+  messages: JsonlMessage[],
+): string {
+  const types: string[] = [];
+  for (const message of messages) {
+    if (!Array.isArray(message.content)) continue;
+    for (const block of message.content) {
+      if (typeof block !== "object" || block === null) continue;
+      const record = block as Record<string, unknown>;
+      const type = record["type"];
+      if (typeof type !== "string") continue;
+      if (type === "tool_use" && typeof record["name"] === "string") {
+        types.push(`tool_use:${record["name"]}`);
+        continue;
+      }
+      types.push(type);
+    }
+  }
+  if (types.length === 0) return `[${role}]`;
+  return `[${role} · ${types.join(", ")}]`;
+}
+
+async function readPlacementFile(path: string): Promise<string> {
+  try {
+    return await readFile(path, "utf-8");
+  } catch (e) {
+    const message = e instanceof Error ? e.message : String(e);
+    throw new ValidationError(`could not read content_file ${path}: ${message}`);
+  }
 }
 
 function findRangeByPhrase(
@@ -1171,6 +1488,7 @@ export async function handleCompressArc(args: unknown): Promise<ToolResult> {
   const block: Block = {
     block_id: blockId,
     created_at: new Date().toISOString(),
+    kind: "compression",
     active: true,
     anchor_uuid: anchorUuid,
     compressed_uuids: compressedUuids,
@@ -1209,6 +1527,8 @@ export async function dispatch(
   switch (name) {
     case "compress":
       return handleCompress(args);
+    case "place":
+      return handlePlace(args);
     case "decompress":
       return handleDecompress(args);
     case "recompress":

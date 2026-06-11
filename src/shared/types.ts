@@ -1,5 +1,8 @@
+/** Whether a block is summary residue or authored placement. */
+export type BlockKind = "compression" | "placement";
+
 /**
- * Canonical block record: a single compression in the registry.
+ * Canonical block record: a single substitution registered in the registry.
  *
  * Persisted as JSON at ~/.claude/shelving/<session-id>/<block-id>.json.
  * Both the MCP server and the proxy read these files; only the MCP server writes.
@@ -10,6 +13,13 @@ export interface Block {
 
   /** ISO-8601 timestamp of when this block was first created. */
   created_at: string;
+
+  /**
+   * What sort of substitution this block represents.
+   * `compression` is summary residue of prior turns; `placement` is authored
+   * content grafted onto a single anchor turn.
+   */
+  kind: BlockKind;
 
   /**
    * Whether this block is currently substituting in the proxy.
@@ -29,7 +39,7 @@ export interface Block {
   anchor_uuid: string;
 
   /**
-   * All message UUIDs covered by this compression, in order.
+ * All message UUIDs covered by this block, in order.
    * The anchor message is replaced with `summary`; the rest are dropped.
    */
   compressed_uuids: string[];
@@ -68,6 +78,7 @@ export interface Block {
 export interface BlockMeta {
   block_id: number;
   created_at: string;
+  kind: BlockKind;
   active: boolean;
   anchor_uuid: string;
   compressed_uuid_count: number;
@@ -82,6 +93,7 @@ export function blockToMeta(block: Block): BlockMeta {
   return {
     block_id: block.block_id,
     created_at: block.created_at,
+    kind: block.kind,
     active: block.active,
     anchor_uuid: block.anchor_uuid,
     compressed_uuid_count: block.compressed_uuids.length,

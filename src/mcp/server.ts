@@ -2,7 +2,7 @@
 /**
  * Shelving MCP server.
  *
- * Exposes compress / decompress / recompress / list_compressions as
+ * Exposes compress / place / decompress / recompress / list_compressions as
  * model-callable tools. State is persisted to ~/.claude/shelving/<session>/
  * (override via CLAUDE_SHELVING_DIR env var).
  *

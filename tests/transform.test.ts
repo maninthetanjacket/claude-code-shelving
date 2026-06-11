@@ -13,6 +13,7 @@ function makeBlock(overrides: Partial<Block> = {}): Block {
   return {
     block_id: 1,
     created_at: "2026-05-08T14:30:00Z",
+    kind: "compression",
     active: true,
     anchor_uuid: "u1",
     compressed_uuids: ["u1", "u2", "u3"],
@@ -129,6 +130,23 @@ test("focus appears in shelved marker", () => {
     result.request.messages[0]?.content as string,
     /preserved decisions about auth/,
   );
+});
+
+test("placement blocks substitute through the proxy with the same mechanics as compression blocks", () => {
+  const request = makeRequest([{ role: "user", content: "msg1" }]);
+  const jsonl = makeJsonl([["u1", "user", "msg1"]]);
+  const block = makeBlock({
+    kind: "placement",
+    anchor_uuid: "u1",
+    compressed_uuids: ["u1"],
+    summary: "Placed sensory stone.",
+  });
+
+  const result = applySubstitutions(request, jsonl, [block]);
+  assert.equal(result.anchors_substituted, 1);
+  assert.equal(result.messages_dropped, 0);
+  assert.match(result.request.messages[0]?.content as string, /Placed sensory stone\./);
+  assert.match(result.request.messages[0]?.content as string, /\[shelved: block 1, 1 messages\]/);
 });
 
 test("inactive blocks (passed in but active=false) are still processed if caller filtered correctly", () => {

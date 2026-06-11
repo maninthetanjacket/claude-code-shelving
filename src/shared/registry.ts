@@ -5,7 +5,7 @@ import type { Block, SessionId } from "./types.js";
 import { blockPath, blockTempPath, sessionDir } from "./paths.js";
 
 /**
- * Registry operations for blocks. Both the MCP server and the proxy use these.
+ * Registry operations for substitution blocks. Both the MCP server and the proxy use these.
  *
  * Design notes:
  * - Reads are non-blocking and cheap (small JSON files). The proxy will layer
@@ -26,7 +26,7 @@ export async function readBlock(
   const path = blockPath(sessionId, blockId);
   if (!existsSync(path)) return null;
   const raw = await readFile(path, "utf-8");
-  return JSON.parse(raw) as Block;
+  return normalizeBlockRecord(JSON.parse(raw) as Block);
 }
 
 /**
@@ -43,8 +43,9 @@ export async function writeBlock(
   }
   const tempPath = blockTempPath(sessionId, block.block_id);
   const finalPath = blockPath(sessionId, block.block_id);
+  const normalized = normalizeBlockRecord(block);
   // Trailing newline for human-readability when inspecting on disk.
-  await writeFile(tempPath, JSON.stringify(block, null, 2) + "\n", "utf-8");
+  await writeFile(tempPath, JSON.stringify(normalized, null, 2) + "\n", "utf-8");
   await rename(tempPath, finalPath);
 }
 
@@ -61,7 +62,7 @@ export async function listBlocks(sessionId: SessionId): Promise<Block[]> {
     // Skip temp files and anything not matching <number>.json
     if (!/^\d+\.json$/.test(entry)) continue;
     const raw = await readFile(join(dir, entry), "utf-8");
-    blocks.push(JSON.parse(raw) as Block);
+    blocks.push(normalizeBlockRecord(JSON.parse(raw) as Block));
   }
   blocks.sort((a, b) => a.block_id - b.block_id);
   return blocks;
@@ -76,7 +77,7 @@ export async function listActiveBlocks(
 }
 
 /**
- * Compute the next block_id to assign for a new compression in this session.
+ * Compute the next block_id to assign for a new block in this session.
  * Block ids are monotonic per session, never reused.
  */
 export async function nextBlockId(sessionId: SessionId): Promise<number> {
@@ -114,4 +115,11 @@ export async function sessionMtime(sessionId: SessionId): Promise<number | null>
   if (!existsSync(dir)) return null;
   const s = await stat(dir);
   return s.mtimeMs;
+}
+
+function normalizeBlockRecord(block: Block): Block {
+  return {
+    ...block,
+    kind: block.kind === "placement" ? "placement" : "compression",
+  };
 }

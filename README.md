@@ -1,14 +1,14 @@
 # claude-code-shelving
 
-Deliberate context-shelving for Claude Code. The model invokes a `compress` tool when work is settled enough to be summary-only; a proxy substitutes the registered summary for the original content on subsequent API requests; the session's source-of-truth JSONL stays untouched.
+Deliberate context-shelving for Claude Code. The model can invoke `compress` to substitute a summary for settled work, or `place` to substitute authored content at a single anchor turn; the proxy applies the registered substitution on subsequent API requests; the session's source-of-truth JSONL stays untouched.
 
-**Status:** Stage 1 working end-to-end and validated against real CC sessions. 120 passing tests including E2E proxy + cache stability and regressions for harness-injected reminders, `tool_use` metadata drift, tool_use anchors embedded in larger multi-block messages, tool-pair ID matching as a backstop when content bytes drift, and calibrated token estimation. The proxy injects `[turn N]` markers at the start of assistant responses so the model can address ranges by turn number; `compress` accepts UUID-list, phrase-pair, or turn-range selection. The canonical design document lives at `field-guide/shared-space/shelving-design.md` during development.
+**Status:** Stage 1 working end-to-end and validated against real CC sessions. 132 passing tests including E2E proxy + cache stability and regressions for harness-injected reminders, `tool_use` metadata drift, tool_use anchors embedded in larger multi-block messages, tool-pair ID matching as a backstop when content bytes drift, placement refusal on unclosed tool pairs, and calibrated token estimation. The proxy injects `[turn N]` markers at the start of assistant responses so the model can address ranges by turn number; `compress` accepts UUID-list, phrase-pair, or turn-range selection, and `place` accepts turn / UUID / unique-phrase anchor selection. The canonical design document lives at `field-guide/shared-space/shelving-design.md` during development.
 
 ## Architecture
 
 Two coordinated components:
 
-- **MCP server** (`src/mcp/`) — exposes `compress` / `decompress` / `recompress` / `list_compressions` / `start_arc` / `compress_arc` as model-callable tools. Reads from and writes to the registry.
+- **MCP server** (`src/mcp/`) — exposes `compress` / `place` / `decompress` / `recompress` / `list_compressions` / `start_arc` / `compress_arc` as model-callable tools. Reads from and writes to the registry.
 - **Proxy** (`src/proxy/`) — HTTP server between Claude Code and the Anthropic API. Reads the registry on each request and applies cache-stable substitutions.
 
 They communicate via a file-based registry under `~/.claude/shelving/<session-id>/`. They never talk to each other directly; both just read/write the same JSON files.
@@ -38,7 +38,7 @@ npm run build
 
 ## Configure
 
-Two pieces need to be wired up: the MCP server (so the model can call `compress` and friends) and the proxy (so substitutions actually reach the API).
+Two pieces need to be wired up: the MCP server (so the model can call `compress`, `place`, and friends) and the proxy (so substitutions actually reach the API).
 
 ### 1. Register the MCP server with Claude Code
 
@@ -207,6 +207,41 @@ With `preview_only: true`, the server returns the resolved turn range, matched a
 
 All three modes run a pair-closure pass after resolving the candidate range. If the range includes a `tool_use`, its paired `tool_result` is pulled in too; if the range would begin on a `tool_result`, the range extends backward to include the earlier `tool_use` rather than trimming the selected start away. This keeps tool exchanges structurally closed before compression. All three modes return a `block_id`. On the next API request, the proxy substitutes the summary for the anchor message (first message of the resolved range) and drops the rest. Token-count estimates (`original_tokens`, `summary_tokens`) are optional registry metadata; the server estimates `original_tokens` from JSONL content if omitted (see [Token estimation](#token-estimation)).
 
+### Placement
+
+`place` is the sibling operation to `compress`: mechanically it is a single-turn substitution, but semantically it is not a summary. New authored material enters the model's apparent history at exactly one anchor turn.
+
+Integrity properties for placement are explicit:
+
+- **Deliberate** — the author chooses one anchor by turn number, UUID, or unique phrase match.
+- **Previewed** — `preview_only: true` shows the resolved anchor turn, its current content snippet, and the replacement content before anything is written.
+- **Reversible** — `decompress` restores the original turn; `recompress` re-applies the placement byte-identically.
+- **Registry-marked** — blocks are stored with `kind: "placement"` so listings stay honest about residue versus grafts.
+
+Inline content:
+
+```json
+{
+  "turn": 412,
+  "content": "A cold stone in the pocket, river-smooth and damp.",
+  "preview_only": true
+}
+```
+
+File-backed content:
+
+```json
+{
+  "anchor_uuid": "uuid-1",
+  "content_file": "/absolute/path/to/sensory-stone.txt",
+  "confirm": true
+}
+```
+
+`content` and `content_file` are mutually exclusive. `turn`, `anchor_uuid`, and `phrase` are mutually exclusive. When preview looks right, re-call with `confirm: true` to persist the placement.
+
+Placement is exactly one message. The same tool-pair closure logic used by compression is checked here too, but with a stricter rule: if the chosen anchor would need to auto-extend to keep a `tool_use` and `tool_result` together, `place` refuses rather than widening the range. That way the operation never swallows turns the author did not choose.
+
 ### Token estimation
 
 `original_tokens` and `find-arc`'s `estimated_tokens` come from a calibrated estimator in `src/shared/token-count.ts`. The goal is to judge how much *Claude* context a range actually occupies.
@@ -248,6 +283,8 @@ Reactivates a previously decompressed block. The summary text is byte-identical 
 ```
 
 Returns metadata for all blocks in the current session (active and inactive).
+
+Each listed block includes `kind`, so operators can see whether it is a `compression` or a `placement`.
 
 ### Bookmarking a range (alternative to enumerating UUIDs)
 
@@ -351,12 +388,13 @@ cd claude-code-shelving && npm test
 ## Stage 1 scope
 
 What's implemented:
-- `compress`, `decompress`, `recompress`, `list_compressions` MCP tools
+- `compress`, `place`, `decompress`, `recompress`, `list_compressions` MCP tools
 - `start_arc` / `compress_arc` MCP tools for bookmark-based range capture (label a starting point, do work, compress the labeled range without enumerating UUIDs)
 - `find-arc` CLI for assistive boundary discovery (mechanical search; model decides)
 - Calibrated token estimation (real BPE tokenizer over all block types, calibrated to Claude `input_tokens` with a content-density term and a thinking-signature term; see "Token estimation")
 - Range-based compress (model provides explicit UUID list)
 - Model-authored summaries (no proxy-side summarization)
+- Authored single-turn placements with preview, reversal, and registry-marked `kind`
 - Cache-stable proxy substitution
 - Content-normalized matching: tolerates JSONL/API drift (thinking blocks, trailing newlines, harness-injected `<system-reminder>` on `tool_result`, `caller` metadata on `tool_use`). See `src/proxy/transform.ts` for the canonicalization invariant.
 - Fragment-level anchor matching: when an anchor `tool_use` lives inside a larger assistant message (with thinking and text alongside), substitution happens in place — surrounding content is preserved.

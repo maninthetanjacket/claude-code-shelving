@@ -6,6 +6,7 @@ import { join } from "node:path";
 
 import {
   handleCompress,
+  handlePlace,
   handleDecompress,
   handleRecompress,
   handleList,
@@ -149,6 +150,7 @@ test("compress creates a block with correct fields", async () => {
 
   const block = await readBlock(TEST_SESSION, 1);
   assert.notEqual(block, null);
+  assert.equal(block?.kind, "compression");
   assert.equal(block?.summary, "Three messages collapsed.");
   assert.equal(block?.focus, "test focus");
   assert.deepEqual(block?.compressed_uuids, ["msg_a", "msg_b", "msg_c"]);
@@ -813,6 +815,150 @@ test("compress accepts a contiguous range that includes an attachment UUID once"
 });
 
 // ---------------------------------------------------------------------------
+// place
+// ---------------------------------------------------------------------------
+
+test("place preview shows the anchor turn, current snippet, and replacement content", async () => {
+  await writeSimpleSessionJsonl(TEST_SESSION, ["u1", "a1", "u2"]);
+
+  const result = await handlePlace({
+    session_id: TEST_SESSION,
+    turn: 2,
+    content: "A cool, dry river stone in the pocket.",
+    preview_only: true,
+  });
+
+  assert.equal(result.isError, undefined);
+  const payload = parseResult(result) as Record<string, unknown>;
+  assert.equal(payload["preview"], true);
+  assert.equal(payload["anchor_turn"], 2);
+  assert.equal(payload["anchor_uuid"], "a1");
+  assert.match(String(payload["anchor_snippet"]), /content-a1/);
+  assert.equal(
+    payload["replacement_content"],
+    "A cool, dry river stone in the pocket.",
+  );
+
+  const block = await readBlock(TEST_SESSION, 1);
+  assert.equal(block, null);
+});
+
+test("place creates a single-turn placement block from content_file and list_compressions surfaces kind", async () => {
+  await writeSimpleSessionJsonl(TEST_SESSION, ["u1", "a1", "u2"]);
+  const contentPath = join(tempRoot, "placement.txt");
+  await writeFile(contentPath, "Wet granite smell after rain.\n", "utf-8");
+
+  const result = await handlePlace({
+    session_id: TEST_SESSION,
+    anchor_uuid: "a1",
+    content_file: contentPath,
+    confirm: true,
+  });
+
+  assert.equal(result.isError, undefined);
+  const payload = parseResult(result) as Record<string, unknown>;
+  assert.equal(payload["block_id"], 1);
+  assert.equal(payload["anchor_uuid"], "a1");
+  assert.equal(payload["compressed_count"], 1);
+  assert.equal(payload["kind"], "placement");
+
+  const block = await readBlock(TEST_SESSION, 1);
+  assert.notEqual(block, null);
+  assert.equal(block?.kind, "placement");
+  assert.deepEqual(block?.compressed_uuids, ["a1"]);
+  assert.equal(block?.summary, "Wet granite smell after rain.\n");
+
+  await handleCompress({
+    session_id: TEST_SESSION,
+    compressed_uuids: ["u2"],
+    summary: "compressed",
+  });
+
+  const listed = parseResult(
+    await handleList({ session_id: TEST_SESSION }),
+  ) as Record<string, unknown>;
+  const blocks = listed["blocks"] as Array<Record<string, unknown>>;
+  assert.equal(blocks[0]?.["kind"], "placement");
+  assert.equal(blocks[1]?.["kind"], "compression");
+});
+
+test("place refuses to auto-extend a single-turn anchor that contains a tool_use with an external tool_result", async () => {
+  await writeRawSessionJsonl(TEST_SESSION, [
+    {
+      type: "assistant",
+      uuid: "a1",
+      message: {
+        role: "assistant",
+        content: [
+          { type: "text", text: "running a command" },
+          { type: "tool_use", id: "toolu_pair", name: "Bash", input: { cmd: "pwd" } },
+        ],
+      },
+    },
+    {
+      type: "user",
+      uuid: "u1",
+      message: {
+        role: "user",
+        content: [
+          {
+            type: "tool_result",
+            tool_use_id: "toolu_pair",
+            content: "command output",
+          },
+        ],
+      },
+    },
+  ]);
+
+  const result = await handlePlace({
+    session_id: TEST_SESSION,
+    turn: 1,
+    content: "A cedar smell in the stairwell.",
+    preview_only: true,
+  });
+
+  assert.equal(result.isError, true);
+  assert.match(getText(result), /refuse|cannot/i);
+  assert.match(getText(result), /tool_result/i);
+});
+
+test("decompress and recompress work for placement blocks", async () => {
+  await writeSimpleSessionJsonl(TEST_SESSION, ["u1", "a1"]);
+  await handlePlace({
+    session_id: TEST_SESSION,
+    phrase: "content-a1",
+    content: "A brass key warmed by the sun.",
+    confirm: true,
+  });
+
+  const blockBefore = await readBlock(TEST_SESSION, 1);
+  assert.equal(blockBefore?.kind, "placement");
+  assert.equal(blockBefore?.active, true);
+
+  const decompressed = parseResult(
+    await handleDecompress({ session_id: TEST_SESSION, block_id: 1 }),
+  ) as Record<string, unknown>;
+  assert.equal(decompressed["active"], false);
+  assert.equal(decompressed["messages_restored"], 1);
+
+  const blockAfterDecompress = await readBlock(TEST_SESSION, 1);
+  assert.equal(blockAfterDecompress?.kind, "placement");
+  assert.equal(blockAfterDecompress?.active, false);
+
+  const recompressed = parseResult(
+    await handleRecompress({ session_id: TEST_SESSION, block_id: 1 }),
+  ) as Record<string, unknown>;
+  assert.equal(recompressed["active"], true);
+  assert.equal(recompressed["messages_replaced"], 1);
+
+  const blockAfterRecompress = await readBlock(TEST_SESSION, 1);
+  assert.equal(blockAfterRecompress?.kind, "placement");
+  assert.equal(blockAfterRecompress?.active, true);
+  assert.equal(blockAfterRecompress?.summary, blockBefore?.summary);
+});
+
+// ---------------------------------------------------------------------------
 // decompress
 // ---------------------------------------------------------------------------
 
@@ -933,10 +1079,12 @@ test("list_compressions returns metadata for all blocks", async () => {
   assert.equal(blocks.length, 2);
   assert.equal(blocks[0]?.["block_id"], 1);
   assert.equal(blocks[0]?.["active"], false);
+  assert.equal(blocks[0]?.["kind"], "compression");
   assert.equal(blocks[0]?.["compressed_uuid_count"], 1);
   assert.equal(blocks[0]?.["focus"], "f1");
   assert.equal(blocks[1]?.["block_id"], 2);
   assert.equal(blocks[1]?.["active"], true);
+  assert.equal(blocks[1]?.["kind"], "compression");
   assert.equal(blocks[1]?.["compressed_uuid_count"], 2);
 });
 
@@ -962,6 +1110,20 @@ test("dispatch routes to correct handler", async () => {
   assert.equal(result.isError, undefined);
   const payload = parseResult(result) as Record<string, unknown>;
   assert.equal(payload["block_id"], 1);
+});
+
+test("dispatch routes place correctly", async () => {
+  await writeSimpleSessionJsonl(TEST_SESSION, ["msg_a"]);
+  const result = await dispatch("place", {
+    session_id: TEST_SESSION,
+    anchor_uuid: "msg_a",
+    content: "placed text",
+    confirm: true,
+  });
+  assert.equal(result.isError, undefined);
+  const payload = parseResult(result) as Record<string, unknown>;
+  assert.equal(payload["block_id"], 1);
+  assert.equal(payload["kind"], "placement");
 });
 
 test("dispatch returns error for unknown tool", async () => {

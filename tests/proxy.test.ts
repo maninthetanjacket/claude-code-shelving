@@ -166,6 +166,7 @@ function makeBlock(overrides: Partial<Block>): Block {
   return {
     block_id: 1,
     created_at: "2026-05-08T14:30:00Z",
+    kind: "compression",
     active: true,
     anchor_uuid: "u1",
     compressed_uuids: ["u1"],
