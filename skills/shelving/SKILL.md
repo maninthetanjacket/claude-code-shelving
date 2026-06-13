@@ -69,6 +69,28 @@ Six MCP tools: `compress`, `decompress`, `recompress`, `list_compressions`,
   (cache-stable). Re-authoring a summary (see Revision below) breaks that
   cache property — a deliberate tradeoff, make it knowingly.
 
+## Finding ranges (assistive CLIs)
+
+Two read-only CLIs narrow the search space mechanically; both leave the
+deciding to you. Run via `npm run <name> -- <args>` or the built `dist/cli/`.
+
+- **`session-map <session-id>`** — start here when you don't yet know *where*
+  the heavy ranges are. Groups turns into sittings by inter-turn time gap
+  (`--gap-minutes`, default 30) and prints a per-group token map: turn range,
+  time + duration, summed tokens, % of session, an ASCII bar, and an extractive
+  summary line (first real prompt + dominant tools). The fat, tooling-heavy
+  sittings — the aggressive-tier candidates — stand out immediately. Turn
+  numbers are the same collapsed-stream indices `compress` uses, so a range
+  reads straight into `start_turn`/`end_turn`. `--emit-block G` writes an
+  **inert** scaffold (`active: false`, placeholder summary, computed
+  uuids/tokens) to a plain file as a planning artifact — it never enters the
+  registry and substitutes nothing; the real summary and tool-pair closure
+  still happen at `compress` time. The extractive line is a targeting aid, not
+  a draft to keep.
+- **`find-arc <session-id> "phrase"`** — use when you already have a topic in
+  mind. Returns candidate UUID ranges by phrase match (exact → all-words →
+  any-word), with boundary previews and token estimates.
+
 ## Authoring summaries
 
 The summary becomes the past: on every subsequent request, future-you

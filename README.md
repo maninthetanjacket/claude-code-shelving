@@ -2,7 +2,7 @@
 
 Deliberate context-shelving for Claude Code. The model can invoke `compress` to substitute a summary for settled work, or `place` to substitute authored content at a single anchor turn; the proxy applies the registered substitution on subsequent API requests; the session's source-of-truth JSONL stays untouched.
 
-**Status:** Stage 1 working end-to-end and validated against real CC sessions. 138 passing tests including E2E proxy + cache stability and regressions for harness-injected reminders, `tool_use` metadata drift, tool-use anchors embedded in larger multi-block messages, tool-pair ID matching as a backstop when content bytes drift, live `tool_result` preservation inside mixed user messages, merged image/document fragment dropping for shelved turns, nested `tool_result.content` rewrites for `document` + `search_result`, placement refusal on unclosed tool pairs, and calibrated token estimation. The proxy injects `[turn N]` markers at the start of assistant responses so the model can address ranges by turn number; `compress` accepts UUID-list, phrase-pair, or turn-range selection, and `place` accepts turn / UUID / unique-phrase anchor selection. The canonical design document lives at `field-guide/shared-space/shelving-design.md` during development.
+**Status:** Stage 1 working end-to-end and validated against real CC sessions. 145 passing tests including E2E proxy + cache stability and regressions for harness-injected reminders, `tool_use` metadata drift, tool-use anchors embedded in larger multi-block messages, tool-pair ID matching as a backstop when content bytes drift, live `tool_result` preservation inside mixed user messages, merged image/document fragment dropping for shelved turns, nested `tool_result.content` rewrites for `document` + `search_result`, placement refusal on unclosed tool pairs, and calibrated token estimation. The proxy injects `[turn N]` markers at the start of assistant responses so the model can address ranges by turn number; `compress` accepts UUID-list, phrase-pair, or turn-range selection, and `place` accepts turn / UUID / unique-phrase anchor selection. The canonical design document lives at `field-guide/shared-space/shelving-design.md` during development.
 
 For the current best handoff note on how Claude Code reshapes stored transcript messages before API send, see [OBSERVED_NORMALIZATION_RULES.md](./OBSERVED_NORMALIZATION_RULES.md).
 
@@ -140,7 +140,7 @@ The session UUID is preserved across `--resume`, so any registry state under `~/
 
 ### Finding messages to compress
 
-Two paths: assistive CLI for the common case, manual JSONL inspection for everything else.
+Three paths: two assistive CLIs and manual JSONL inspection. Use `session-map` when you don't yet know *where* the heavy ranges are, `find-arc` when you have a topic phrase, and manual inspection for everything else.
 
 **Assistive CLI: `find-arc`.** Surfaces candidate UUID ranges given a topic phrase. Doesn't decide what to shelve — narrows the search space.
 
@@ -157,7 +157,23 @@ Matching strategies, in preference order: exact phrase → all words within an a
 
 The model uses this to find candidate boundaries, then confirms them by inspecting context, then calls `compress`. Inspection-as-judgment stays with the model; inspection-as-mechanics is delegated.
 
-**Manual fallback.** When `find-arc` doesn't fit (no clear topic phrase, complex boundaries):
+**Assistive CLI: `session-map`.** A whole-session token map for deciding *what's worth shelving in the first place*. Groups turns into sittings by inter-turn time gap and reports per-group token occupancy, so the fat ranges stand out before you pick boundaries.
+
+```bash
+node dist/cli/session-map.js <session-id> [options]
+```
+
+Options:
+- `--gap-minutes N` — start a new group when the gap between turns exceeds N minutes (default: 30)
+- `--format text|json` — output format (default: text)
+- `--emit-block G` — write an inert Block scaffold for group G (see below)
+- `--out PATH` — where to write the scaffold (default: `./shelve-block-group<G>.json`)
+
+The text view is one row per group: turn range, start time + duration, summed tokens (calibrated — see [Token estimation](#token-estimation)), percent of session, an ASCII bar scaled to the largest group, and an extractive summary line (the sitting's first real user prompt plus its dominant tools). Turn numbers are 1-indexed positions in the collapsed UUID stream — **the same numbering `compress` uses** — so a range read off the map drops straight into `start_turn`/`end_turn`. `--format json` exposes the same per-group fields (`start_turn`, `end_turn`, timestamps, `duration_min`, `tokens`, `pct`, `roles`, `tools`, `summary`) for tooling.
+
+`--emit-block G` writes a planning artifact: a `Block` (matching `src/shared/types.ts`) with `active: false`, a placeholder summary, and computed `compressed_uuids` / `original_tokens` for the group's range. It is written to a plain file, **never** into the registry — so it can't collide with a future `compress` id and won't substitute anything until a real summary is authored and it's deliberately registered. The extractive summary is a *targeting aid*, not a draft to keep: the actual first-person shelving summary is still the model's to author at `compress` time, which also runs tool-pair closure that the scaffold deliberately skips. The recommended path is to hand the printed `start_turn`/`end_turn` to the `compress` MCP tool.
+
+**Manual fallback.** When neither CLI fits (no clear topic phrase, complex boundaries):
 
 ```bash
 ls ~/.claude/projects/                                 # find project slug
@@ -392,7 +408,8 @@ cd claude-code-shelving && npm test
 What's implemented:
 - `compress`, `place`, `decompress`, `recompress`, `list_compressions` MCP tools
 - `start_arc` / `compress_arc` MCP tools for bookmark-based range capture (label a starting point, do work, compress the labeled range without enumerating UUIDs)
-- `find-arc` CLI for assistive boundary discovery (mechanical search; model decides)
+- `find-arc` CLI for assistive boundary discovery (mechanical phrase search; model decides)
+- `session-map` CLI for whole-session token mapping by time-grouped sittings, with optional inert Block scaffolds for targeting shelving ranges
 - Calibrated token estimation (real BPE tokenizer over all block types, calibrated to Claude `input_tokens` with a content-density term and a thinking-signature term; see "Token estimation")
 - Range-based compress (model provides explicit UUID list)
 - Model-authored summaries (no proxy-side summarization)
