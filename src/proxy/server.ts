@@ -37,7 +37,7 @@ import { request as httpsRequest } from "node:https";
 import { once } from "node:events";
 import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { applySubstitutions } from "./transform.js";
+import { applySubstitutions, type ApiRequest } from "./transform.js";
 import { getActiveBlocksCached, getJsonlMessagesCached } from "./cache.js";
 import { loadSessionMessages } from "./jsonl.js";
 
@@ -203,6 +203,69 @@ function collapseConsecutiveDuplicates(values: string[]): string[] {
     }
   }
   return collapsed;
+}
+
+const TURN_MARKER_PREFIX_RE = /^(?:\[turn \d+\](?:\r?\n){2})+/;
+
+function stripLeadingTurnMarkerPrefixes(text: string): string {
+  return text.replace(TURN_MARKER_PREFIX_RE, "");
+}
+
+function stripTurnMarkersFromAssistantContent(
+  content: string | unknown[],
+): { content: string | unknown[]; changed: boolean } {
+  if (typeof content === "string") {
+    const stripped = stripLeadingTurnMarkerPrefixes(content);
+    return { content: stripped, changed: stripped !== content };
+  }
+
+  const rewritten = content.slice();
+  for (let i = 0; i < rewritten.length; i += 1) {
+    const block = rewritten[i];
+    if (typeof block !== "object" || block === null) {
+      continue;
+    }
+
+    const record = block as Record<string, unknown>;
+    if (record["type"] !== "text" || typeof record["text"] !== "string") {
+      continue;
+    }
+
+    const stripped = stripLeadingTurnMarkerPrefixes(record["text"]);
+    if (stripped === record["text"]) {
+      return { content, changed: false };
+    }
+
+    rewritten[i] = {
+      ...record,
+      text: stripped,
+    };
+    return { content: rewritten, changed: true };
+  }
+
+  return { content, changed: false };
+}
+
+export function stripInjectedTurnMarkersFromRequest(request: ApiRequest): ApiRequest {
+  let changed = false;
+  const messages = request.messages.map((message) => {
+    if (message.role !== "assistant") {
+      return message;
+    }
+
+    const stripped = stripTurnMarkersFromAssistantContent(message.content);
+    if (!stripped.changed) {
+      return message;
+    }
+
+    changed = true;
+    return {
+      ...message,
+      content: stripped.content,
+    };
+  });
+
+  return changed ? { ...request, messages } : request;
 }
 
 interface ForwardedResponse {
@@ -443,6 +506,8 @@ async function handleMessages(
   const bodyBuf = await readBody(req);
   let modifiedBuf = bodyBuf;
   let transformInfo = "passthrough";
+  let parsedBody: ApiRequest | null = null;
+  let strippedAssistantTurnMarkers = false;
 
   // Only real conversation turns get a [turn N] marker. The auxiliary
   // requests CC fires (title generation, quota pings) are single-message and
@@ -451,9 +516,15 @@ async function handleMessages(
   let markerEligible = false;
   try {
     const probe = JSON.parse(bodyBuf.toString("utf-8"));
-    if (probe !== null && typeof probe === "object") {
+    if (probe !== null && typeof probe === "object" && Array.isArray(probe.messages)) {
+      parsedBody = stripInjectedTurnMarkersFromRequest(probe as ApiRequest);
+      strippedAssistantTurnMarkers = parsedBody !== probe;
+      if (strippedAssistantTurnMarkers) {
+        modifiedBuf = Buffer.from(JSON.stringify(parsedBody), "utf-8");
+      }
+
       const hasThinking = probe.thinking !== undefined && probe.thinking !== null;
-      const msgCount = Array.isArray(probe.messages) ? probe.messages.length : 0;
+      const msgCount = probe.messages.length;
       markerEligible = hasThinking || msgCount > 1;
     }
   } catch {
@@ -480,7 +551,7 @@ async function handleMessages(
       dumpMeta["jsonl_message_count"] = jsonlMessages.length;
 
       if (activeBlocks.length > 0) {
-        const parsed = JSON.parse(bodyBuf.toString("utf-8"));
+        const parsed = parsedBody ?? JSON.parse(modifiedBuf.toString("utf-8"));
         if (
           parsed !== null &&
           typeof parsed === "object" &&
@@ -518,6 +589,13 @@ async function handleMessages(
     }
   } else {
     transformInfo = "passthrough (no session id)";
+  }
+
+  if (strippedAssistantTurnMarkers) {
+    transformInfo =
+      transformInfo === "passthrough"
+        ? "passthrough (stripped assistant turn markers)"
+        : `${transformInfo}; stripped assistant turn markers`;
   }
 
   dumpMeta["transform_info"] = transformInfo;

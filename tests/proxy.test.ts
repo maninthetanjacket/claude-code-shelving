@@ -15,6 +15,7 @@ import { gzipSync } from "node:zlib";
 import {
   createProxyServer,
   resolveSessionId,
+  stripInjectedTurnMarkersFromRequest,
   type ProxyConfig,
 } from "../src/proxy/server.ts";
 import { writeBlock } from "../src/shared/registry.ts";
@@ -207,6 +208,32 @@ test("resolveSessionId: handles array header values", () => {
   );
 });
 
+test("stripInjectedTurnMarkersFromRequest: removes repeated leading markers from assistant text", () => {
+  const request = {
+    model: "claude-opus-4.7",
+    messages: [
+      {
+        role: "assistant" as const,
+        content: [
+          { type: "thinking", thinking: "hmm" },
+          { type: "text", text: "[turn 78]\n\n[turn 78]\n\nhello" },
+        ],
+      },
+      {
+        role: "user" as const,
+        content: "[turn 78]\n\nquoted transcript",
+      },
+    ],
+  };
+
+  const stripped = stripInjectedTurnMarkersFromRequest(request);
+  assert.deepEqual(stripped.messages[0]?.content, [
+    { type: "thinking", thinking: "hmm" },
+    { type: "text", text: "hello" },
+  ]);
+  assert.equal(stripped.messages[1]?.content, "[turn 78]\n\nquoted transcript");
+});
+
 // ---------------------------------------------------------------------------
 // End-to-end integration tests
 // ---------------------------------------------------------------------------
@@ -254,6 +281,48 @@ test("E2E: passthrough when no active blocks for session", async () => {
     assert.equal(res.status, 200);
     assert.equal(upstream.captured[0]?.body, reqBody);
     assert.equal(upstream.captured[0]?.headers["accept-encoding"], "identity");
+  } finally {
+    await proxy.close();
+    await upstream.close();
+  }
+});
+
+test("E2E: passthrough strips injected turn markers from assistant history before forwarding", async () => {
+  const upstream = await startFakeUpstream();
+  const proxy = await startProxy(upstream.url);
+  try {
+    const reqBody = JSON.stringify({
+      model: "claude-opus-4.7",
+      messages: [
+        {
+          role: "assistant",
+          content: [
+            { type: "thinking", thinking: "private" },
+            { type: "text", text: "[turn 12]\n\n[turn 12]\n\nalready injected" },
+          ],
+        },
+        {
+          role: "user",
+          content: "[turn 12]\n\nquoted transcript",
+        },
+      ],
+    });
+    const res = await fetch(new URL("/v1/messages", proxy.url), {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-claude-code-session-id": SESSION_ID,
+      },
+      body: reqBody,
+    });
+    assert.equal(res.status, 200);
+
+    const upstreamBody = JSON.parse(upstream.captured[0]?.body ?? "{}");
+    assert.deepEqual(upstreamBody.messages[0].content, [
+      { type: "thinking", thinking: "private" },
+      { type: "text", text: "already injected" },
+    ]);
+    assert.equal(upstreamBody.messages[1].content, "[turn 12]\n\nquoted transcript");
   } finally {
     await proxy.close();
     await upstream.close();
