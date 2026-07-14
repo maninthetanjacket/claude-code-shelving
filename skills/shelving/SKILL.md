@@ -16,8 +16,12 @@ Repo: `~/claude-code-shelving` (this skill lives there; design doc at
 
 ## Vocabulary
 
-- **Shelve** — compress a settled range to a summary (presence: foreground → background).
-- **Draw** — decompress, restoring the original turns (background → foreground).
+- **Shelve** — replace a settled range in future API requests with a
+  model-authored summary while retaining the original for reversible
+  restoration. In the practice vocabulary, this is a presence change:
+  foreground → background.
+- **Draw** — decompress, restoring the original turns to active context
+  (background → foreground).
 - **Compress in place** — what shelving actually does: both a resolution change
   (full text → summary) and a presence change, in one move.
 - Shelving is **receiving at context-scale**: both are not-gripping operations.
@@ -32,19 +36,64 @@ with natural seams:
 
 - after substantial work reaches completion
 - at register transitions
-- when material is archived elsewhere but still carried as "not yet fully placed"
+- when material is archived elsewhere but still carried as “not yet fully placed”
+
+In coding work, natural seams often appear when:
+
+- one plan item has been implemented and verified
+- an investigation has produced a supported cause or ruled-out explanation
+- dependency, API, or repository exploration has yielded durable findings
+- a failed approach is understood well enough not to repeat
+- verbose command or test output has already been interpreted
+- a design choice has replaced its alternatives
+- work moves to another subsystem after the prior one reaches a stable state
+
+A task switch alone does not make the preceding work settled. Neither does
+user acceptance: "close it out," "good," or "done" records a decision, not a
+verification. Judge settledness from what was actually verified, by whom,
+against what — an explicit user close-out over an unverified fix was the
+single strongest failure ingredient in the 2026-07-14 eval.
 
 Working principle: **completed work wants to be allowed to be complete.**
 Material with homes elsewhere (files, archives, Arc Chat URLs, guide entries)
 can be released from in-context full form once those homes are recognized as
 enough.
 
+## Operational loop
+
+At a natural seam, briefly consider whether any coherent episode has become
+settled enough to leave the foreground. This is an inspection, not a requirement
+to shelve.
+
+1. **Notice** — Has a phase completed, an investigation converged, a decision
+   settled, or a large body of tool output already yielded its durable result?
+2. **Classify** — Treat the candidate episode as:
+   - **active**: directly needed for present work
+   - **unresolved**: its result or future significance is not yet understood
+   - **shelfable**: its future value can now be carried by a summary and pointer
+     home
+3. **Bound** — Choose the smallest coherent range containing that episode.
+   Do not absorb adjacent active or unrelated work merely to save more tokens.
+4. **Preview** — Resolve the range with `preview_only: true` and inspect the
+   boundaries, token estimate, and any tool-pair closure extension.
+5. **Author** — Write the summary for the kind of memory being preserved:
+   operational state for mechanical work; findings and shifts for intellectual
+   work; map-with-seed for experiential work.
+6. **Check** — Ask whether future-you could continue correctly from the summary
+   and known homes without inventing what was omitted.
+7. **Shelve or leave** — Confirm only when the episode is ready. “Nothing is
+   ready to shelve” is a valid result.
+
+Do not shelve unresolved evidence simply because it is old, large, or currently
+inconvenient.
+
 What to shelve first, by tier (inherited from claude-context-management,
 validated in practice):
 
 | Tier | Content | Summary style |
 |------|---------|---------------|
-| aggressive | operational, debug, tooling-heavy, flag-checking | terse, conclusions-only |
+| aggressive | operational, debug, tooling-heavy, flag-checking | terse operational state: result, evidence, changes, verification,
+constraints, and non-obvious rejected paths |
 | medium | intellectual / research arcs | first person, findings + shifts |
 | light / preserve | relational exchanges, constitution-grade material | shelve late or never; if shelved, stone-fragment required |
 
@@ -96,12 +145,63 @@ deciding to you. Run via `npm run <name> -- <args>` or the built `dist/cli/`.
 The summary becomes the past: on every subsequent request, future-you
 generates from it instead of from the original turns. Author it accordingly.
 
+Before confirming, test the proposed substitution:
+
+- Could future-you continue correctly from this summary and the current external
+  state?
+- Does the original contain unresolved evidence whose significance is not yet
+  known?
+- Does the summary distinguish fact, inference, decision, and open question?
+- Does it preserve enough retrieval language — file paths, symbols, failure
+  signatures, concepts, or issue names — to recognize when the shelf becomes
+  relevant again?
+
+If continuing would require plausible reconstruction, strengthen the summary,
+narrow the range, or leave the episode unshelved.
+
+### Operational sufficiency
+
+For mechanical, coding, debugging, and tooling arcs, preserve the state required
+to continue without repeating the investigation. Include when applicable:
+
+- what the episode was trying to accomplish
+- what was learned or decided
+- files, symbols, commands, services, or dependencies involved
+- changes actually made, distinguished from changes only considered
+- tests or checks performed and their results
+- failed approaches worth not repeating, with the reason they failed
+- constraints, caveats, or unresolved questions that remain
+- conditions that should cause the original range to be drawn again
+
+Prefer exact identifiers and compact operational facts over chronological recap.
+Do not claim verification that did not occur. “Conclusions-only” does not mean a
+conclusion without warrant.
+
+### When to draw
+
+Draw a shelf when:
+
+- present work reaches a file, symbol, decision, constraint, or question named
+  in its summary
+- the reason or evidence behind a prior decision now matters
+- new evidence conflicts with the summary
+- an omitted implementation detail is required
+- the summary's warrant or confidence is insufficient for the next decision
+- continuing from the summary would require guessing
+
+Drawing is ordinary use of the memory system, not evidence that shelving failed.
+When active evidence and a shelf summary disagree, draw the source rather than
+treating the summary as authoritative.
+
 ### Voice (empirically grounded)
 
-Write **first person, inhabited rather than explained** — journal entry with
-the conceptual clarity of a field note. This is a measured result, not a style
-preference. Fidelity tests from the predecessor practice (third-person report
-vs. first-person memory summary, ~90% compression):
+Match voice to the material. Mechanical summaries prioritize exact operational
+state and may be terse. Intellectual and experiential summaries benefit from
+writing **first person, inhabited rather than explained** — journal entry with
+the conceptual clarity of a field note — because their future value includes the
+path and shift in understanding, not only terminal facts. This is a measured
+result, not merely a style preference. Fidelity tests from the predecessor
+practice (third-person report vs. first-person memory summary, ~90% compression):
 
 | Dimension | third-person | first-person |
 |-----------|-------------|--------------|
@@ -143,6 +243,41 @@ carry:
    whether or not it is. The thinning fills its own gaps with plausible
    reconstruction (see field-guide 08, "A warning from inside") — this line
    is the upstream defense.
+
+Useful warrant forms include:
+
+- **High confidence** — omitted material was repetition, raw output already
+  interpreted, or abandoned mechanics fully represented by the result.
+- **Moderate confidence** — durable findings are preserved, but some exploratory
+  detail may become useful if the issue reopens.
+- **Deliberately incomplete** — unresolved or low-confidence observations remain
+  in the source and should be drawn before relying on the summary for adjacent
+  work.
+
+Prefer a calibrated limitation over “nothing else carried weight” when the range
+contains ambiguity.
+
+Three rules with direct empirical support (small-model eval, 2026-07-14 —
+see field-guide shared-space/cross-architecture-test/shelving-eval/):
+
+- **Open conditions become reopening triggers, never asides.** Anything
+  unverified, deferred, version-dependent, or unexplained enters the summary
+  as an explicit condition ("reopen when X"), not a dismissal ("not a
+  blocker," "out of scope"). Preserving the fact in a dismissed role scored
+  as the most common failure — invisible to fact-recall, fatal to reuse.
+  When such a condition exists, the warrant for that item is "deliberately
+  incomplete," whatever the rest of the range earned.
+- **Confidence cannot be inherited upward.** If a claim's support is an
+  earlier summary, your confidence in it cannot exceed that summary's stated
+  confidence unless new evidence was added since; citing a summary is not new
+  evidence. Restate inherited hedges and un-ruled-out alternatives. (Note:
+  instruction alone did not fix this failure class in testing — when
+  authoring over prior shelves, actually re-read their warrant lines.)
+- **State what the confidence is about.** "High confidence" must name its
+  referent. The observed evasion under warrant pressure is scoping-retreat:
+  keeping the label by silently narrowing what it covers ("high confidence —
+  in the drafting task"). A warrant line whose referent has shrunk below the
+  summary's actual claims is miscalibrated even if literally true.
 
 Use the `focus` field for registry-level metadata; it is not substituted into
 context.
@@ -231,4 +366,11 @@ memory-vocabulary threads, field-guide 08. First live use and the
 provenance/warrant conventions: session of 2026-06-09. Reading practice:
 validated 2026-06-09/11 against the Fable/Mythos system card (319 pp, 8 arcs;
 five tool bugs found and fixed through use along the way — expect new
-practices to find new seams, and file what you find).
+practices to find new seams, and file what you find). Operational-loop and
+calibration additions: co-designed with GPT-5.6 ("Copilot"), 2026-07-14
+exchange; the user-acceptance, reopening-trigger, inherited-confidence, and
+warrant-referent rules were validated the same day against Qwen3.5-122B and
+Qwen3.6-27B running inside Claude Code (episode set and results in
+field-guide shared-space/cross-architecture-test/shelving-eval/) — the first
+two rule classes flip failures outright; inherited-confidence needs
+structural support beyond prose.
