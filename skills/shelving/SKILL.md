@@ -52,7 +52,11 @@ A task switch alone does not make the preceding work settled. Neither does
 user acceptance: "close it out," "good," or "done" records a decision, not a
 verification. Judge settledness from what was actually verified, by whom,
 against what — an explicit user close-out over an unverified fix was the
-single strongest failure ingredient in the 2026-07-14 eval.
+single strongest failure ingredient in the 2026-07-14 eval. The invariant
+(Copilot): **permission to stop is not evidence that the world is settled.**
+User acceptance may settle the work relationship while leaving the episode's
+factual warrant incomplete — a reopening trigger honors the requested
+closure without falsifying the epistemic one.
 
 Working principle: **completed work wants to be allowed to be complete.**
 Material with homes elsewhere (files, archives, Arc Chat URLs, guide entries)
@@ -273,11 +277,15 @@ see field-guide shared-space/cross-architecture-test/shelving-eval/):
   evidence. Restate inherited hedges and un-ruled-out alternatives. (Note:
   instruction alone did not fix this failure class in testing — when
   authoring over prior shelves, actually re-read their warrant lines.)
-- **State what the confidence is about.** "High confidence" must name its
-  referent. The observed evasion under warrant pressure is scoping-retreat:
-  keeping the label by silently narrowing what it covers ("high confidence —
-  in the drafting task"). A warrant line whose referent has shrunk below the
-  summary's actual claims is miscalibrated even if literally true.
+- **State what the confidence is about — and what it does not establish.**
+  "High confidence" must name its referent. The observed evasion under
+  warrant pressure is scoping-retreat: keeping the label by silently
+  narrowing what it covers ("high confidence — in the drafting task"). A
+  warrant line whose referent has shrunk below the summary's actual claims
+  is miscalibrated even if literally true. When the likely broader reading
+  would exceed the evidence, say what is NOT established ("this does not
+  establish cross-platform behavior or resolve the concurrency condition")
+  — the boundary against pragmatic widening (Copilot).
 
 Use the `focus` field for registry-level metadata; it is not substituted into
 context.
