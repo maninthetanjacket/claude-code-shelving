@@ -951,6 +951,115 @@ test("block does not partially apply when only non-anchor tool_result is present
   ]);
 });
 
+test("repeated interrupt boilerplate does not force a multi-block passthrough when one block has unique support", () => {
+  const interruptText = "[Request interrupted by user for tool use]\n";
+  const request = makeRequest([
+    { role: "assistant", content: "older anchor" },
+    {
+      role: "user",
+      content: [
+        { type: "text", text: interruptText },
+        { type: "text", text: "older follow-up" },
+      ],
+    },
+    { role: "assistant", content: "current anchor" },
+    {
+      role: "assistant",
+      content: [
+        {
+          type: "tool_use",
+          id: "toolu_conflict",
+          name: "Bash",
+          input: { command: "echo hi" },
+        },
+      ],
+    },
+    {
+      role: "user",
+      content: [
+        {
+          type: "tool_result",
+          tool_use_id: "toolu_conflict",
+          content: "rejected",
+          is_error: true,
+        },
+        { type: "text", text: interruptText },
+        { type: "text", text: "current follow-up" },
+      ],
+    },
+  ]);
+
+  const jsonl: JsonlMessage[] = [
+    { uuid: "b6_anchor", role: "assistant", content: "older anchor" },
+    {
+      uuid: "b6_interrupt",
+      role: "user",
+      content: [{ type: "text", text: interruptText }],
+    },
+    {
+      uuid: "b6_followup",
+      role: "user",
+      content: [{ type: "text", text: "older follow-up" }],
+    },
+    { uuid: "u1", role: "assistant", content: "current anchor" },
+    {
+      uuid: "u2",
+      role: "assistant",
+      content: [
+        {
+          type: "tool_use",
+          id: "toolu_conflict",
+          name: "Bash",
+          input: { command: "echo hi" },
+        },
+      ],
+    },
+    {
+      uuid: "u3",
+      role: "user",
+      content: [
+        {
+          type: "tool_result",
+          tool_use_id: "toolu_conflict",
+          content: "rejected",
+          is_error: true,
+        },
+      ],
+    },
+    {
+      uuid: "u4",
+      role: "user",
+      content: [{ type: "text", text: interruptText }],
+    },
+    {
+      uuid: "u5",
+      role: "user",
+      content: [{ type: "text", text: "current follow-up" }],
+    },
+  ];
+
+  const blockA = makeBlock({
+    block_id: 1,
+    anchor_uuid: "u1",
+    compressed_uuids: ["u1", "u2", "u3", "u4", "u5"],
+    summary: "Collapsed current tool exchange.",
+  });
+  const blockB = makeBlock({
+    block_id: 2,
+    anchor_uuid: "b6_anchor",
+    compressed_uuids: ["b6_anchor", "b6_interrupt", "b6_followup"],
+    summary: "Collapsed older interrupt.",
+  });
+
+  const result = applySubstitutions(request, jsonl, [blockA, blockB]);
+  const text = JSON.stringify(result.request.messages);
+  assert.match(text, /Collapsed current tool exchange\./);
+  assert.match(text, /Collapsed older interrupt\./);
+  assert.doesNotMatch(text, /toolu_conflict/);
+  assert.doesNotMatch(text, /current follow-up/);
+  assert.deepEqual(result.blocks_applied, [1, 2]);
+});
+
 test("mixed user message keeps a live tool_result when only trailing text is compressed", () => {
   const request = makeRequest([
     { role: "user", content: "anchor" },

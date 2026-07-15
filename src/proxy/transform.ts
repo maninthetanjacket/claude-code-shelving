@@ -267,16 +267,24 @@ export function applySubstitutions(
 
     const blockIds = new Set(blockHits.map((entry) => entry.hit.block.block_id));
     if (blockIds.size > 1) {
-      // Ambiguous: this API message appears to contain content from multiple
-      // blocks. Fail safe to passthrough rather than risking a wrong rewrite.
-      const ids = Array.from(blockIds).sort((a, b) => a - b);
-      for (const blockId of ids) {
-        const trace = blockTraceById.get(blockId);
-        if (trace === undefined || trace.conflictWith !== null) continue;
-        trace.conflictWith = ids.find((id) => id !== blockId) ?? null;
+      const disambiguatedBlockId = selectDominantBlockId(apiMsg, resolved, uuidToBlock);
+      if (disambiguatedBlockId === null) {
+        // Ambiguous: this API message appears to contain content from multiple
+        // blocks. Fail safe to passthrough rather than risking a wrong rewrite.
+        const ids = Array.from(blockIds).sort((a, b) => a - b);
+        for (const blockId of ids) {
+          const trace = blockTraceById.get(blockId);
+          if (trace === undefined || trace.conflictWith !== null) continue;
+          trace.conflictWith = ids.find((id) => id !== blockId) ?? null;
+        }
+        newMessages.push(apiMsg);
+        continue;
       }
-      newMessages.push(apiMsg);
-      continue;
+      blockHits.splice(
+        0,
+        blockHits.length,
+        ...blockHits.filter((entry) => entry.hit.block.block_id === disambiguatedBlockId),
+      );
     }
 
     const blockHit = blockHits[0];
@@ -400,6 +408,67 @@ function blockSkipReason(trace: {
     return `conflict-with-block-${trace.conflictWith}`;
   }
   return "anchor-not-found";
+}
+
+function selectDominantBlockId(
+  message: ApiMessage,
+  resolved: ResolvedMessageMatch | undefined,
+  uuidToBlock: Map<string, { block: Block; role: "anchor" | "drop" }>,
+): number | null {
+  if (resolved === undefined) return null;
+
+  const uniqueSupportByBlockId = new Map<number, number>();
+  if (resolved.exactUuid !== null) {
+    const hit = uuidToBlock.get(resolved.exactUuid);
+    if (hit !== undefined) {
+      uniqueSupportByBlockId.set(hit.block.block_id, 1);
+    }
+  }
+
+  if (Array.isArray(message.content)) {
+    for (let i = 0; i < message.content.length; i++) {
+      const fragmentMatch = resolved.fragmentMatches[i];
+      if (fragmentMatch === undefined) continue;
+      collectUniqueFragmentSupport(fragmentMatch, uniqueSupportByBlockId, uuidToBlock);
+    }
+  }
+
+  const supportedBlocks = Array.from(uniqueSupportByBlockId.entries())
+    .filter(([, count]) => count > 0)
+    .sort((a, b) => b[1] - a[1]);
+
+  if (supportedBlocks.length !== 1) {
+    return null;
+  }
+  return supportedBlocks[0]?.[0] ?? null;
+}
+
+function collectUniqueFragmentSupport(
+  resolved: ResolvedBlockMatch,
+  uniqueSupportByBlockId: Map<number, number>,
+  uuidToBlock: Map<string, { block: Block; role: "anchor" | "drop" }>,
+): void {
+  const directBlockIds = Array.from(
+    new Set(
+      resolved.directMatchedUuids
+        .map((uuid) => uuidToBlock.get(uuid)?.block.block_id)
+        .filter((blockId): blockId is number => blockId !== undefined),
+    ),
+  );
+
+  if (directBlockIds.length === 1) {
+    const blockId = directBlockIds[0];
+    if (blockId !== undefined) {
+      uniqueSupportByBlockId.set(
+        blockId,
+        (uniqueSupportByBlockId.get(blockId) ?? 0) + 1,
+      );
+    }
+  }
+
+  for (const nested of resolved.nestedMatches) {
+    collectUniqueFragmentSupport(nested, uniqueSupportByBlockId, uuidToBlock);
+  }
 }
 
 function expandBlocksForChildMedia(
