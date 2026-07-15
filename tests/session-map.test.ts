@@ -12,7 +12,9 @@ import {
   buildScaffold,
   readTimestamps,
   SCAFFOLD_PLACEHOLDER,
+  annotateShelfCoverage,
 } from "../src/cli/session-map.ts";
+import type { Block } from "../src/shared/types.ts";
 
 let tempRoot: string;
 
@@ -168,4 +170,67 @@ test("findSessionJsonl + readTimestamps round-trip recovers per-uuid timestamps"
   const ts = await readTimestamps(path!);
   assert.equal(ts.get("u1"), at(0));
   assert.equal(ts.get("a1"), at(7));
+});
+
+function fakeBlock(over: Partial<Block>): Block {
+  return {
+    block_id: 1,
+    created_at: new Date().toISOString(),
+    kind: "compression",
+    active: true,
+    anchor_uuid: "u1",
+    compressed_uuids: ["u1"],
+    summary: "s",
+    original_tokens: 0,
+    summary_tokens: 0,
+    focus: "",
+    parent_block_id: null,
+    ...over,
+  };
+}
+
+test("annotateShelfCoverage: shelved tokens subtract, summary tokens add at anchor", async () => {
+  const sid = "sess-shelf";
+  await writeSession(sid, [
+    line({ uuid: "u1", role: "user", content: "aaaa aaaa aaaa aaaa", ts: at(0) }),
+    line({ uuid: "a1", role: "assistant", content: "bbbb bbbb bbbb bbbb", ts: at(1) }),
+    line({ uuid: "u2", role: "user", content: "cccc", ts: at(2) }),
+  ]);
+  const path = await findSessionJsonl(sid);
+  const messages = await parseSessionJsonl(path!);
+  const turns = buildTurns(messages, await readTimestamps(path!));
+  const groups = groupTurns(turns, 30);
+  const g = groups[0]!;
+  const t1 = turns[0]!.tokens;
+  const t2 = turns[1]!.tokens;
+
+  annotateShelfCoverage(groups, turns, [
+    fakeBlock({ anchor_uuid: "u1", compressed_uuids: ["u1", "a1"], summary_tokens: 3 }),
+  ]);
+  assert.equal(g.shelved_tokens, t1 + t2);
+  assert.equal(g.substituted_tokens, 3);
+  assert.equal(g.effective_tokens, g.tokens - (t1 + t2) + 3);
+});
+
+test("annotateShelfCoverage: inactive blocks are ignored; no blocks leaves groups untouched", async () => {
+  const sid = "sess-shelf-2";
+  await writeSession(sid, [
+    line({ uuid: "u1", role: "user", content: "aaaa aaaa", ts: at(0) }),
+    line({ uuid: "a1", role: "assistant", content: "bbbb bbbb", ts: at(1) }),
+  ]);
+  const path = await findSessionJsonl(sid);
+  const messages = await parseSessionJsonl(path!);
+  const turns = buildTurns(messages, await readTimestamps(path!));
+  const groups = groupTurns(turns, 30);
+  const g = groups[0]!;
+
+  annotateShelfCoverage(groups, turns, [
+    fakeBlock({ active: false, compressed_uuids: ["u1", "a1"], summary_tokens: 5 }),
+  ]);
+  assert.equal(g.shelved_tokens, 0);
+  assert.equal(g.effective_tokens, g.tokens);
+
+  annotateShelfCoverage(groups, turns, []);
+  assert.equal(g.shelved_tokens, 0);
+  assert.equal(g.effective_tokens, g.tokens);
 });

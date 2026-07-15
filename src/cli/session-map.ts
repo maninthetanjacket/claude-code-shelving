@@ -22,6 +22,7 @@ import { readFile } from "node:fs/promises";
 import { findSessionJsonl, parseSessionJsonl } from "../proxy/jsonl.js";
 import type { JsonlMessage } from "../proxy/transform.js";
 import { countContentTokens } from "../shared/token-count.js";
+import { listActiveBlocks } from "../shared/registry.js";
 import type { Block } from "../shared/types.js";
 
 // ---------------------------------------------------------------------------
@@ -114,6 +115,12 @@ export interface Group {
   roles: { user: number; assistant: number };
   tools: Array<{ name: string; count: number }>;
   summary: string;
+  /** Tokens of this group covered by active shelving blocks. */
+  shelved_tokens: number;
+  /** Summary tokens substituted into this group by active blocks whose anchor lies here. */
+  substituted_tokens: number;
+  /** tokens - shelved_tokens + substituted_tokens: what this group costs after substitution. */
+  effective_tokens: number;
 }
 
 /**
@@ -190,7 +197,54 @@ function buildGroup(cluster: Turn[], groupNum: number, totalTokens: number): Gro
     roles: { user: userCount, assistant: assistantCount },
     tools,
     summary: extractiveSummary(cluster, tools),
+    shelved_tokens: 0,
+    substituted_tokens: 0,
+    effective_tokens: tokens,
   };
+}
+
+// ---------------------------------------------------------------------------
+// Shelf coverage
+// ---------------------------------------------------------------------------
+
+/**
+ * Annotate groups with active-shelf coverage. For each group, shelved_tokens
+ * sums the token occupancy of its turns whose UUIDs belong to any active
+ * block's compressed_uuids; substituted_tokens adds each block's
+ * summary_tokens to the group containing its anchor turn (the summary
+ * substitutes at the anchor position). effective_tokens is what the group
+ * costs after proxy substitution. Estimation caveat: summary_tokens is
+ * registry metadata supplied at compress time; 0 means unrecorded, so
+ * effective totals are lower bounds when authors omitted it.
+ */
+export function annotateShelfCoverage(groups: Group[], turns: Turn[], blocks: Block[]): void {
+  const active = blocks.filter((b) => b.active);
+  if (active.length === 0) return;
+  const shelvedUuids = new Set<string>();
+  const anchorSummaryTokens = new Map<string, number>();
+  for (const b of active) {
+    for (const u of b.compressed_uuids) shelvedUuids.add(u);
+    anchorSummaryTokens.set(
+      b.anchor_uuid,
+      (anchorSummaryTokens.get(b.anchor_uuid) ?? 0) + b.summary_tokens,
+    );
+  }
+  const byTurn = new Map<number, Turn>();
+  for (const t of turns) byTurn.set(t.turn, t);
+  for (const g of groups) {
+    let shelved = 0;
+    let substituted = 0;
+    for (let i = g.start_turn; i <= g.end_turn; i++) {
+      const t = byTurn.get(i);
+      if (t === undefined) continue;
+      if (shelvedUuids.has(t.uuid)) shelved += t.tokens;
+      const st = anchorSummaryTokens.get(t.uuid);
+      if (st !== undefined) substituted += st;
+    }
+    g.shelved_tokens = shelved;
+    g.substituted_tokens = substituted;
+    g.effective_tokens = g.tokens - shelved + substituted;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -354,9 +408,13 @@ export function renderText(groups: Group[], sessionId: string, gapMinutes: numbe
   );
   for (const g of groups) {
     const range = `${g.start_turn}–${g.end_turn}`;
+    const shelfNote =
+      g.shelved_tokens > 0
+        ? ` [${Math.round((g.shelved_tokens / g.tokens) * 100)}% shelved → ~${fmtTokens(g.effective_tokens)} effective]`
+        : "";
     lines.push(
       `${pad(String(g.group), 4)}${pad(range, 13)}${pad(fmtWhen(g.start_ts, g.duration_min), 20)}` +
-        `${padStart(fmtTokens(g.tokens), 8)}${padStart(`${Math.round(g.pct * 100)}%`, 5)}  ${bar(g.pct, maxPct)}`,
+        `${padStart(fmtTokens(g.tokens), 8)}${padStart(`${Math.round(g.pct * 100)}%`, 5)}  ${bar(g.pct, maxPct)}${shelfNote}`,
     );
     if (g.summary.length > 0) lines.push(`      ${g.summary}`);
   }
@@ -364,6 +422,13 @@ export function renderText(groups: Group[], sessionId: string, gapMinutes: numbe
   lines.push(
     `${pad("TOT", 4)}${pad(`${totalTurns} turns`, 13)}${pad("", 20)}${padStart(fmtTokens(totalTokens), 8)}${padStart("100%", 5)}`,
   );
+  const totalShelved = groups.reduce((s2, g) => s2 + g.shelved_tokens, 0);
+  if (totalShelved > 0) {
+    const totalEffective = groups.reduce((s2, g) => s2 + g.effective_tokens, 0);
+    lines.push(
+      `${pad("EFF", 4)}${pad("", 13)}${pad("(after active shelves)", 22)}${padStart(`~${fmtTokens(totalEffective)}`, 8)}${padStart(`${Math.round((totalEffective / totalTokens) * 100)}%`, 5)}`,
+    );
+  }
   return lines.join("\n") + "\n";
 }
 
@@ -390,6 +455,9 @@ export function renderJson(groups: Group[], sessionId: string, gapMinutes: numbe
           roles: g.roles,
           tools: g.tools,
           summary: g.summary,
+          shelved_tokens: g.shelved_tokens,
+          substituted_tokens: g.substituted_tokens,
+          effective_tokens: g.effective_tokens,
         })),
       },
       null,
@@ -501,6 +569,12 @@ async function main(): Promise<void> {
 
   const turns = buildTurns(messages, timestamps);
   const groups = groupTurns(turns, args.gapMinutes);
+  try {
+    const blocks = await listActiveBlocks(args.sessionId);
+    annotateShelfCoverage(groups, turns, blocks);
+  } catch {
+    // No registry (or unreadable) — render without shelf coverage, as before.
+  }
 
   if (args.emitBlock !== null) {
     const group = groups.find((g) => g.group === args.emitBlock);
