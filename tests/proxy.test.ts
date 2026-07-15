@@ -1,6 +1,6 @@
 import { test, before, after, beforeEach } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, rm, writeFile, mkdir } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, rm, writeFile, mkdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -116,7 +116,10 @@ async function startFakeUpstream(): Promise<FakeUpstream> {
   return upstream;
 }
 
-async function startProxy(upstream: URL): Promise<{
+async function startProxy(
+  upstream: URL,
+  overrides: Partial<ProxyConfig> = {},
+): Promise<{
   url: URL;
   close: () => Promise<void>;
 }> {
@@ -125,6 +128,7 @@ async function startProxy(upstream: URL): Promise<{
     bind: "127.0.0.1",
     upstream,
     logLevel: "silent",
+    ...overrides,
   };
   const server = createProxyServer(config);
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
@@ -792,6 +796,142 @@ test("E2E: /health returns 200 without hitting upstream", async () => {
   } finally {
     await proxy.close();
     await upstream.close();
+  }
+});
+
+test("E2E: /status reports the last request and info logs include per-block outcomes", async () => {
+  await writeSessionJsonl(SESSION_ID, [
+    { uuid: "u_old", role: "user", content: "old message" },
+    { uuid: "u1", role: "user", content: "msg1" },
+    { uuid: "u2", role: "assistant", content: "msg2" },
+    { uuid: "u3", role: "user", content: "msg3" },
+  ]);
+  await writeBlock(
+    SESSION_ID,
+    makeBlock({
+      block_id: 1,
+      anchor_uuid: "u1",
+      compressed_uuids: ["u1", "u2"],
+      summary: "Collapsed.",
+    }),
+  );
+  await writeBlock(
+    SESSION_ID,
+    makeBlock({
+      block_id: 2,
+      anchor_uuid: "u_old",
+      compressed_uuids: ["u_old"],
+      summary: "Old summary.",
+    }),
+  );
+
+  const stderrChunks: string[] = [];
+  const originalWrite = process.stderr.write.bind(process.stderr);
+  process.stderr.write = ((chunk: string | Uint8Array) => {
+    stderrChunks.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf-8"));
+    return true;
+  }) as typeof process.stderr.write;
+
+  const upstream = await startFakeUpstream();
+  const proxy = await startProxy(upstream.url, { logLevel: "info" });
+  try {
+    const res = await fetch(new URL("/v1/messages", proxy.url), {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-claude-code-session-id": SESSION_ID,
+      },
+      body: JSON.stringify({
+        model: "claude-opus-4.7",
+        messages: [
+          { role: "user", content: "msg1" },
+          { role: "assistant", content: "msg2" },
+          { role: "user", content: "msg3" },
+        ],
+      }),
+    });
+    assert.equal(res.status, 200);
+
+    const statusRes = await fetch(new URL("/status", proxy.url));
+    assert.equal(statusRes.status, 200);
+    const statusBody = (await statusRes.json()) as Record<string, unknown>;
+    assert.equal(statusBody["sessions_seen"], 1);
+    const lastRequest = statusBody["last_request"] as Record<string, unknown>;
+    assert.equal(lastRequest["session_id"], SESSION_ID);
+    assert.deepEqual(lastRequest["blocks_applied"], [1]);
+    assert.deepEqual(lastRequest["blocks_skipped"], [
+      { block_id: 2, reason: "anchor-not-found" },
+    ]);
+    assert.equal(lastRequest["messages_dropped"], 1);
+    assert.equal(typeof lastRequest["timestamp"], "string");
+
+    const stderr = stderrChunks.join("");
+    assert.match(stderr, /block 1 applied/);
+    assert.match(stderr, /block 2 SKIPPED reason=anchor-not-found/);
+    assert.equal(upstream.captured.length, 1, "/status should not forward upstream");
+  } finally {
+    process.stderr.write = originalWrite;
+    await proxy.close();
+    await upstream.close();
+  }
+});
+
+test("E2E: request dump metadata includes skipped block reasons", async () => {
+  await writeSessionJsonl(SESSION_ID, [
+    { uuid: "u_old", role: "user", content: "old message" },
+    { uuid: "u1", role: "user", content: "msg1" },
+    { uuid: "u2", role: "assistant", content: "msg2" },
+  ]);
+  await writeBlock(
+    SESSION_ID,
+    makeBlock({
+      block_id: 1,
+      anchor_uuid: "u1",
+      compressed_uuids: ["u1", "u2"],
+      summary: "Collapsed.",
+    }),
+  );
+  await writeBlock(
+    SESSION_ID,
+    makeBlock({
+      block_id: 2,
+      anchor_uuid: "u_old",
+      compressed_uuids: ["u_old"],
+      summary: "Old summary.",
+    }),
+  );
+
+  const dumpDir = await mkdtemp(join(tmpdir(), "shelving-proxy-dump-"));
+  const upstream = await startFakeUpstream();
+  const proxy = await startProxy(upstream.url, { dumpDir });
+  try {
+    const res = await fetch(new URL("/v1/messages", proxy.url), {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-claude-code-session-id": SESSION_ID,
+      },
+      body: JSON.stringify({
+        model: "claude-opus-4.7",
+        messages: [
+          { role: "user", content: "msg1" },
+          { role: "assistant", content: "msg2" },
+        ],
+      }),
+    });
+    assert.equal(res.status, 200);
+
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    const entries = (await readdir(dumpDir)).filter((name) => name.endsWith(".meta.json"));
+    assert.equal(entries.length, 1);
+    const meta = JSON.parse(await readFile(join(dumpDir, entries[0]!), "utf-8")) as Record<string, unknown>;
+    assert.deepEqual(meta["blocks_skipped"], [
+      { block_id: 2, reason: "anchor-not-found" },
+    ]);
+  } finally {
+    await proxy.close();
+    await upstream.close();
+    await rm(dumpDir, { recursive: true, force: true });
   }
 });
 

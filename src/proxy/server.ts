@@ -37,7 +37,11 @@ import { request as httpsRequest } from "node:https";
 import { once } from "node:events";
 import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { applySubstitutions, type ApiRequest } from "./transform.js";
+import {
+  applySubstitutions,
+  type ApiRequest,
+  type BlockSkippedInfo,
+} from "./transform.js";
 import { getActiveBlocksCached, getJsonlMessagesCached } from "./cache.js";
 import { loadSessionMessages } from "./jsonl.js";
 
@@ -57,6 +61,19 @@ export interface ProxyConfig {
    * applying as expected. Disabled when undefined.
    */
   dumpDir?: string;
+}
+
+interface LastRequestStatus {
+  session_id: string;
+  blocks_applied: number[];
+  blocks_skipped: BlockSkippedInfo[];
+  messages_dropped: number;
+  timestamp: string;
+}
+
+interface ProxyStatusSnapshot {
+  sessions_seen: number;
+  last_request: LastRequestStatus | null;
 }
 
 export function loadConfigFromEnv(): ProxyConfig {
@@ -494,6 +511,7 @@ async function handleMessages(
   res: ServerResponse,
   config: ProxyConfig,
   log: ReturnType<typeof makeLogger>,
+  status: { sessionsSeen: Set<string>; lastRequest: LastRequestStatus | null },
 ): Promise<void> {
   const abortController = new AbortController();
   const abortUpstream = () => {
@@ -540,6 +558,7 @@ async function handleMessages(
 
   const sessionId = resolveSessionId(req.headers);
   if (sessionId !== null) {
+    status.sessionsSeen.add(sessionId);
     try {
       const [activeBlocks, jsonlMessages] = await Promise.all([
         getActiveBlocksCached(sessionId),
@@ -557,18 +576,37 @@ async function handleMessages(
           typeof parsed === "object" &&
           Array.isArray(parsed.messages)
         ) {
+          const requestTimestamp = new Date().toISOString();
           const result = applySubstitutions(parsed, jsonlMessages, activeBlocks);
           modifiedBuf = Buffer.from(JSON.stringify(result.request), "utf-8");
           transformInfo =
             `applied blocks=[${result.blocks_applied.join(",")}] ` +
             `substituted=${result.anchors_substituted} ` +
             `dropped=${result.messages_dropped}`;
+          for (const decision of result.block_decisions) {
+            if (decision.status === "applied") {
+              log("info", `block ${decision.block_id} applied session=${sessionId}`);
+            } else {
+              log(
+                "info",
+                `block ${decision.block_id} SKIPPED reason=${decision.reason} session=${sessionId}`,
+              );
+            }
+          }
           dumpMeta["request_message_count"] = parsed.messages.length;
           dumpMeta["transformed_message_count"] = result.request.messages.length;
           dumpMeta["blocks_applied"] = result.blocks_applied;
           dumpMeta["blocks_inactive_in_request"] = result.blocks_inactive_in_request;
+          dumpMeta["blocks_skipped"] = result.blocks_skipped;
           dumpMeta["anchors_substituted"] = result.anchors_substituted;
           dumpMeta["messages_dropped"] = result.messages_dropped;
+          status.lastRequest = {
+            session_id: sessionId,
+            blocks_applied: result.blocks_applied,
+            blocks_skipped: result.blocks_skipped,
+            messages_dropped: result.messages_dropped,
+            timestamp: requestTimestamp,
+          };
         } else {
           transformInfo = "passthrough (no messages array)";
         }
@@ -636,6 +674,7 @@ async function handlePassthrough(
   res: ServerResponse,
   config: ProxyConfig,
   log: ReturnType<typeof makeLogger>,
+  status: { sessionsSeen: Set<string>; lastRequest: LastRequestStatus | null },
 ): Promise<void> {
   const abortController = new AbortController();
   const abortUpstream = () => {
@@ -646,6 +685,9 @@ async function handlePassthrough(
   res.on("close", abortUpstream);
 
   const sessionId = resolveSessionId(req.headers);
+  if (sessionId !== null) {
+    status.sessionsSeen.add(sessionId);
+  }
   const upstreamUrl = new URL(req.url ?? "/", config.upstream);
   const bodyBuf =
     req.method === "GET" || req.method === "HEAD" ? undefined : await readBody(req);
@@ -672,6 +714,10 @@ async function handlePassthrough(
 
 export function createProxyServer(config: ProxyConfig): Server {
   const log = makeLogger(config.logLevel);
+  const status = {
+    sessionsSeen: new Set<string>(),
+    lastRequest: null as LastRequestStatus | null,
+  };
 
   return createHttpServer((req, res) => {
     const pathname = requestPathname(req.url);
@@ -684,12 +730,22 @@ export function createProxyServer(config: ProxyConfig): Server {
       return;
     }
 
+    if (req.url === "/status" && req.method === "GET") {
+      const body: ProxyStatusSnapshot = {
+        sessions_seen: status.sessionsSeen.size,
+        last_request: status.lastRequest,
+      };
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify(body));
+      return;
+    }
+
     const handler =
       req.method === "POST" && pathname === "/v1/messages"
         ? (r: IncomingMessage, w: ServerResponse) =>
-            handleMessages(r, w, config, log)
+            handleMessages(r, w, config, log, status)
         : (r: IncomingMessage, w: ServerResponse) =>
-            handlePassthrough(r, w, config, log);
+            handlePassthrough(r, w, config, log, status);
 
     handler(req, res).catch((err) => {
       log(

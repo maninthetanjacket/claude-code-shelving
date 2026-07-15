@@ -585,6 +585,130 @@ test("tool_use still matches when JSONL includes caller metadata but request omi
   assert.deepEqual(result.blocks_applied, [1]);
 });
 
+test("assistant anchor still matches when JSONL carries a stripped turn marker", () => {
+  const request = makeRequest([
+    {
+      role: "assistant",
+      content: [{ type: "text", text: "Proxy topology confirmed." }],
+    },
+    { role: "user", content: "Great, keep going." },
+    { role: "assistant", content: "Next step is the smoke test." },
+  ]);
+
+  const jsonl: JsonlMessage[] = [
+    {
+      uuid: "u1",
+      role: "assistant",
+      content: [{ type: "text", text: "[turn 438]\n\nProxy topology confirmed." }],
+    },
+    { uuid: "u2", role: "user", content: "Great, keep going." },
+    { uuid: "u3", role: "assistant", content: "Next step is the smoke test." },
+  ];
+
+  const block = makeBlock({
+    anchor_uuid: "u1",
+    compressed_uuids: ["u1", "u2", "u3"],
+    summary: "Collapsed proxy setup arc.",
+  });
+
+  const result = applySubstitutions(request, jsonl, [block]);
+  assert.equal(result.request.messages.length, 1);
+  assert.match(
+    JSON.stringify(result.request.messages[0]?.content),
+    /Collapsed proxy setup arc\./,
+  );
+  assert.equal(result.anchors_substituted, 1);
+  assert.equal(result.messages_dropped, 2);
+  assert.deepEqual(result.blocks_applied, [1]);
+});
+
+test("marker-stripped assistant anchor still opens the gate for a mixed text plus tool_use message", () => {
+  const request = makeRequest([
+    {
+      role: "assistant",
+      content: [
+        {
+          type: "text",
+          text: "Keep 122B loaded first; staging the prescreen now:",
+        },
+        {
+          type: "tool_use",
+          id: "toolu_ps1",
+          name: "Bash",
+          input: { command: "cp PS1.md /tmp/episode.md" },
+        },
+      ],
+    },
+    {
+      role: "user",
+      content: [
+        {
+          type: "tool_result",
+          tool_use_id: "toolu_ps1",
+          content: "episode staged",
+          is_error: false,
+        },
+      ],
+    },
+    { role: "assistant", content: "Prescreen is ready." },
+  ]);
+
+  const jsonl: JsonlMessage[] = [
+    {
+      uuid: "u1",
+      role: "assistant",
+      content: [
+        {
+          type: "text",
+          text: "[turn 541]\n\nKeep 122B loaded first; staging the prescreen now:",
+        },
+      ],
+    },
+    {
+      uuid: "u2",
+      role: "assistant",
+      content: [
+        {
+          type: "tool_use",
+          id: "toolu_ps1",
+          name: "Bash",
+          input: { command: "cp PS1.md /tmp/episode.md" },
+        },
+      ],
+    },
+    {
+      uuid: "u3",
+      role: "user",
+      content: [
+        {
+          type: "tool_result",
+          tool_use_id: "toolu_ps1",
+          content: "episode staged",
+          is_error: false,
+        },
+      ],
+    },
+    { uuid: "u4", role: "assistant", content: "Prescreen is ready." },
+  ];
+
+  const block = makeBlock({
+    anchor_uuid: "u1",
+    compressed_uuids: ["u1", "u2", "u3", "u4"],
+    summary: "Collapsed prescreen administration arc.",
+  });
+
+  const result = applySubstitutions(request, jsonl, [block]);
+  assert.equal(result.request.messages.length, 1);
+  assert.ok(Array.isArray(result.request.messages[0]?.content));
+  const content = result.request.messages[0]?.content as Array<Record<string, unknown>>;
+  assert.equal(content.length, 1);
+  assert.equal(content[0]?.["type"], "text");
+  assert.match(String(content[0]?.["text"]), /Collapsed prescreen administration arc\./);
+  assert.equal(result.anchors_substituted, 1);
+  assert.equal(result.messages_dropped, 2);
+  assert.deepEqual(result.blocks_applied, [1]);
+});
+
 test("tool_use_id pairing pulls both sides of a tool exchange into the same block", () => {
   const request = makeRequest([
     {
@@ -822,6 +946,9 @@ test("block does not partially apply when only non-anchor tool_result is present
   assert.equal(result.messages_dropped, 0);
   assert.deepEqual(result.blocks_applied, []);
   assert.deepEqual(result.blocks_inactive_in_request, [1]);
+  assert.deepEqual(result.blocks_skipped, [
+    { block_id: 1, reason: "anchor-content-mismatch" },
+  ]);
 });
 
 test("mixed user message keeps a live tool_result when only trailing text is compressed", () => {
@@ -1188,6 +1315,9 @@ test("block whose UUIDs aren't in the request is reported as inactive_in_request
   assert.equal(result.request.messages[0]?.content, "current");
   assert.deepEqual(result.blocks_applied, []);
   assert.deepEqual(result.blocks_inactive_in_request, [1]);
+  assert.deepEqual(result.blocks_skipped, [
+    { block_id: 1, reason: "anchor-not-found" },
+  ]);
 });
 
 test("non-message fields (model, system, tools) pass through unchanged", () => {

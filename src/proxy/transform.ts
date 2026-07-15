@@ -87,7 +87,25 @@ export interface TransformResult {
   blocks_applied: number[];
   /** Active blocks that had no matched messages (likely older than current request scope). */
   blocks_inactive_in_request: number[];
+  /** Per-block decisions for this request, ordered by block id. */
+  block_decisions: BlockDecision[];
+  /** Active blocks skipped for this request, with the reason from the code path taken. */
+  blocks_skipped: BlockSkippedInfo[];
 }
+
+export type BlockSkipReason =
+  | "anchor-not-found"
+  | "anchor-content-mismatch"
+  | `conflict-with-block-${number}`;
+
+export interface BlockSkippedInfo {
+  block_id: number;
+  reason: BlockSkipReason;
+}
+
+export type BlockDecision =
+  | { block_id: number; status: "applied" }
+  | { block_id: number; status: "skipped"; reason: BlockSkipReason };
 
 /**
  * Apply registered substitutions to an API request.
@@ -127,6 +145,8 @@ export function applySubstitutions(
       messages_dropped: 0,
       blocks_applied: [],
       blocks_inactive_in_request: [],
+      block_decisions: [],
+      blocks_skipped: [],
     };
   }
 
@@ -166,6 +186,25 @@ export function applySubstitutions(
     }
   }
 
+  type BlockTrace = {
+    block_id: number;
+    anyUuidMatched: boolean;
+    anchorSeen: boolean;
+    applied: boolean;
+    conflictWith: number | null;
+  };
+
+  const blockTraceById = new Map<number, BlockTrace>();
+  for (const block of expandedBlocks) {
+    blockTraceById.set(block.block_id, {
+      block_id: block.block_id,
+      anyUuidMatched: false,
+      anchorSeen: false,
+      applied: false,
+      conflictWith: null,
+    });
+  }
+
   const newMessages: ApiMessage[] = [];
   const blocksApplied = new Set<number>();
   const anchorSeenByBlockId = new Set<number>();
@@ -185,8 +224,18 @@ export function applySubstitutions(
   for (const resolved of resolvedPerMessage) {
     for (const uuid of resolved.matchedUuids) {
       const hit = uuidToBlock.get(uuid);
+      if (hit !== undefined) {
+        const trace = blockTraceById.get(hit.block.block_id);
+        if (trace !== undefined) {
+          trace.anyUuidMatched = true;
+        }
+      }
       if (hit?.role === "anchor") {
         anchorSeenByBlockId.add(hit.block.block_id);
+        const trace = blockTraceById.get(hit.block.block_id);
+        if (trace !== undefined) {
+          trace.anchorSeen = true;
+        }
       }
     }
   }
@@ -220,6 +269,12 @@ export function applySubstitutions(
     if (blockIds.size > 1) {
       // Ambiguous: this API message appears to contain content from multiple
       // blocks. Fail safe to passthrough rather than risking a wrong rewrite.
+      const ids = Array.from(blockIds).sort((a, b) => a - b);
+      for (const blockId of ids) {
+        const trace = blockTraceById.get(blockId);
+        if (trace === undefined || trace.conflictWith !== null) continue;
+        trace.conflictWith = ids.find((id) => id !== blockId) ?? null;
+      }
       newMessages.push(apiMsg);
       continue;
     }
@@ -234,6 +289,10 @@ export function applySubstitutions(
     const containsAnchor = blockHits.some((entry) => entry.hit.role === "anchor");
 
     blocksApplied.add(block.block_id);
+    const trace = blockTraceById.get(block.block_id);
+    if (trace !== undefined) {
+      trace.applied = true;
+    }
     if (containsAnchor) {
       const rewrittenContent = rewriteEmbeddedBlockContent(
         apiMsg,
@@ -282,6 +341,7 @@ export function applySubstitutions(
     .map((b) => b.block_id)
     .filter((id) => !blocksApplied.has(id))
     .sort((a, b) => a - b);
+  const blockDecisions = buildBlockDecisions(expandedBlocks, blockTraceById);
 
   return {
     request: { ...request, messages: normalizeMessageSequence(newMessages) },
@@ -289,7 +349,57 @@ export function applySubstitutions(
     messages_dropped: messagesDropped,
     blocks_applied: blocksAppliedList,
     blocks_inactive_in_request: blocksInactive,
+    block_decisions: blockDecisions,
+    blocks_skipped: blockDecisions
+      .filter(
+        (decision): decision is { block_id: number; status: "skipped"; reason: BlockSkipReason } =>
+          decision.status === "skipped",
+      )
+      .map(({ block_id, reason }) => ({ block_id, reason })),
   };
+}
+
+function buildBlockDecisions(
+  blocks: Block[],
+  blockTraceById: Map<number, {
+    block_id: number;
+    anyUuidMatched: boolean;
+    anchorSeen: boolean;
+    applied: boolean;
+    conflictWith: number | null;
+  }>,
+): BlockDecision[] {
+  return blocks
+    .map((block) => blockTraceById.get(block.block_id))
+    .filter((trace): trace is NonNullable<typeof trace> => trace !== undefined)
+    .sort((a, b) => a.block_id - b.block_id)
+    .map((trace) => {
+      if (trace.applied) {
+        return { block_id: trace.block_id, status: "applied" } as const;
+      }
+      return {
+        block_id: trace.block_id,
+        status: "skipped",
+        reason: blockSkipReason(trace),
+      } as const;
+    });
+}
+
+function blockSkipReason(trace: {
+  anyUuidMatched: boolean;
+  anchorSeen: boolean;
+  conflictWith: number | null;
+}): BlockSkipReason {
+  if (!trace.anyUuidMatched) {
+    return "anchor-not-found";
+  }
+  if (!trace.anchorSeen) {
+    return "anchor-content-mismatch";
+  }
+  if (trace.conflictWith !== null) {
+    return `conflict-with-block-${trace.conflictWith}`;
+  }
+  return "anchor-not-found";
 }
 
 function expandBlocksForChildMedia(
@@ -540,7 +650,7 @@ function contentToBlocks(content: string | unknown[]): unknown[] {
  * we don't depend on key reordering here).
  */
 function contentKey(role: string, content: string | unknown[]): string {
-  const normalized = normalizeContent(content);
+  const normalized = normalizeContent(role, content);
   if (typeof normalized === "string") {
     return `${role}:s:${normalized}`;
   }
@@ -548,7 +658,7 @@ function contentKey(role: string, content: string | unknown[]): string {
 }
 
 function fragmentKeys(role: string, content: string | unknown[]): string[] {
-  const normalized = normalizeContent(content);
+  const normalized = normalizeContent(role, content);
   if (typeof normalized === "string") {
     return [`${role}:f:${normalized}`];
   }
@@ -707,7 +817,7 @@ function fragmentKeyForBlock(role: string, block: unknown): string | null {
   if (record["type"] === "text") {
     const text = record["text"];
     if (typeof text !== "string") return null;
-    return `${role}:f:${trimSingleTrailingNewline(text)}`;
+    return `${role}:f:${normalizeTextForMatch(role, text)}`;
   }
   if (record["type"] === "tool_use") {
     return `${role}:f:${JSON.stringify(normalizeToolUseBlock(record))}`;
@@ -922,15 +1032,25 @@ function rewriteResolvedBlock(
  *    Symptom: "tool use concurrency" errors after compressing a range
  *    containing multiple tool calls.
  *
+ * 5. **Strip assistant `[turn N]` prefixes before matching.** The proxy
+ *    removes injected turn markers from assistant history before forwarding
+ *    the request upstream, but older JSONL entries may already have been
+ *    persisted with those prefixes. Treating the marker as semantic content
+ *    makes the anchor UUID disappear after preprocessing, which causes the
+ *    block-level all-or-nothing gate to skip the whole block even when the
+ *    rest of the range still matches.
+ *    Symptom: blocks authored under an earlier marker-injecting proxy appear
+ *    inactive in later requests after the assistant markers are stripped.
+ *
  * Note that this function is used on **both** sides of the comparison —
  * request messages and JSONL messages both pass through it before their
  * keys are computed. Adding a new normalization rule therefore tightens the
  * matcher symmetrically; it can't accidentally make one side stricter than
  * the other.
  */
-function normalizeContent(content: string | unknown[]): string | unknown[] {
+function normalizeContent(role: string, content: string | unknown[]): string | unknown[] {
   if (typeof content === "string") {
-    return trimSingleTrailingNewline(content);
+    return normalizeTextForMatch(role, content);
   }
   const normalized: unknown[] = [];
   for (const block of content) {
@@ -972,7 +1092,7 @@ function normalizeContent(content: string | unknown[]): string | unknown[] {
     if (record["type"] === "text" && typeof record["text"] === "string") {
       normalized.push({
         ...record,
-        text: trimSingleTrailingNewline(record["text"]),
+        text: normalizeTextForMatch(role, record["text"]),
       });
       continue;
     }
@@ -1013,6 +1133,16 @@ function pushUnique(map: Map<string, string[]>, key: string, value: string): voi
 
 function trimSingleTrailingNewline(text: string): string {
   return text.endsWith("\n") ? text.slice(0, -1) : text;
+}
+
+const TURN_MARKER_PREFIX_RE = /^(?:\[turn \d+\](?:\r?\n){2})+/;
+
+function normalizeTextForMatch(role: string, text: string): string {
+  const trimmed = trimSingleTrailingNewline(text);
+  if (role !== "assistant") {
+    return trimmed;
+  }
+  return trimmed.replace(TURN_MARKER_PREFIX_RE, "");
 }
 
 function normalizeToolResultBlock(
